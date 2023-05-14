@@ -1,0 +1,32 @@
+[package]
+name = "yggdrasil-jumper"
+version = "0.1.0"
+edition = "2021"
+authors = [ "one-d-wide <one-d-wide@protonmail.com>" ]
+license = "GPL-3.0"
+repository = "https://github.com/one-d-wide/yggdrasil-jumper"
+default-run = "yggdrasil-jumper"
+
+[[bin]]
+name = "yggdrasil-jumper"
+
+[[bin]]
+name = "stun-tcp"
+
+[dependencies]
+atty = "0.2"
+bytecodec = "0.4"
+bytes = { version = "1.4", features = [ "serde" ] }
+clap = { version = "4.2", features = [ "derive" ] }
+futures = { version = "0.3" }
+rand = { version = "0.8", features = [ "std_rng" ] }
+serde_json = "1.0"
+serde = { version = "1.0", features = [ "derive" ] }
+socket2 = { version = "0.5", features = [ "all" ] }
+stun_codec = "0.3"
+tokio-util = { version = "0.7", features = [ "full" ] }
+tokio = { version = "1.27", features = [ "full" ] }
+toml = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+yggdrasilctl = { version = "1", default-features = false, features = [ "use_tokio" ] }

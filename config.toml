@@ -1,0 +1,47 @@
+# List of possible admin socket locations
+yggdrasil_admin_listen = [
+  "unix:///var/run/yggdrasil/yggdrasil.sock",
+  "unix:///var/run/yggdrasil.sock",
+  "tcp://localhost:9001",
+]
+
+# List of yggdrasil listen addresses
+# Connect to one, instead of using `add/removepeer` commands
+yggdrasil_listen = [ ]
+
+# Default connect/listen port in yggdrasil network
+listen_port = 4701
+
+# Use IPv4/6 NAT traversal
+allow_ipv4 = true
+allow_ipv6 = false
+
+# List of allowed yggdrasil peer addresses
+# Uncomment to apply
+#whitelist = [ ]
+
+# List of STUN servers
+stun_servers = [
+  "stunserver.stunprotocol.org:3478",
+  "136.243.59.79:3478",
+  "34.192.137.246:3478",
+  "94.130.130.49:3478",
+  "192.172.233.145:3478",
+  "185.125.180.70:3478",
+  "95.216.78.222:3478",
+  "88.99.67.241:3478",
+  "88.218.220.40:3478",
+  "54.177.85.190:3478",
+  "88.198.151.128:3478",
+  "83.64.250.246:3478",
+  "62.72.83.10:3478",
+  "202.1.117.2:3478",
+  "188.118.52.172:3478",
+  "51.83.201.84:3478",
+  "34.206.168.53:3478",
+  "157.161.10.32:3478",
+  "91.213.98.54:3478",
+]
+
+# If false servers will be queried one by one
+stun_randomize = true
