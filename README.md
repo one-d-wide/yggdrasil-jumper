@@ -1,6 +1,6 @@
 # Yggdrasil-jumper
 
-This project aims to transparently reduce connection latency over Yggdrasil network for such applications as online gaming, VoIP and others.
+This project aims to transparently reduce latency of a connection over Yggdrasil network for such applications as online gaming, VoIP and others.
 
 ## How it works
 
@@ -36,7 +36,7 @@ yggdrasil_admin_listen = [
   "tcp://localhost:9001",
 ]
 ...
-# List of yggdras listen addresses
+# List of yggdrasil listen addresses
 # Connect to one, instead of using `add/removepeer` commands
 # Noteworthy, this is the only way to use routers prior to v0.4.5 (Oct 2022)
 yggdrasil_listen = [ ]
@@ -80,7 +80,7 @@ $ yggdrasil-jumper --config <path> # standard input will be read if path is "-"
 
 In order to know what address to use with [NAT traversal], jumper must know self external internet address and port. This task is performed using [STUN] protocol with TCP extension, hence not every [STUN] server is supported. [STUN] standard is quite broad, but jumper utilities only address lookup feature.
 
-You can check compatibility using `stun-tcp` binary from this repository.
+You can check compatibility with `stun-tcp` binary from this repository.
 
 ```shell
 $ cargo build --bin stun-tcp --release
@@ -136,7 +136,7 @@ You can read more about the procedure in  [this paper](https://bford.info/pub/ne
 
  The overall pipeline is mostly the same. The most notable improvements are:
 
- * Efficient concurrent multi-tasking.
+ * Efficient concurrent multitasking.
  * Robust error handling.
  * Sane user interface and logging.
  * Support of older routers.
