@@ -4,6 +4,8 @@ pub use {
     socket2::{Domain, Protocol, Socket, Type},
     std::{
         collections::{HashMap, HashSet},
+        future::Future,
+        io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult},
         mem::drop,
         net::{Ipv6Addr, SocketAddr, SocketAddrV6},
         path::{Path, PathBuf},

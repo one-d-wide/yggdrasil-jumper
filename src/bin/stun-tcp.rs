@@ -1,7 +1,5 @@
 use yggdrasil_jumper::*;
 
-use SocketAddr::*;
-
 #[derive(clap::Parser)]
 #[command(name = "stun-tcp", version)]
 pub struct CliArgs {
@@ -97,14 +95,13 @@ async fn start() -> Result<(), ()> {
         let address = lookup_host(server.as_str())
             .await
             .map_err(map_error!("Failed to lookup host"))?
-            .filter(|a| (a.is_ipv4() && cli_args.ipv4) || (a.is_ipv6() && cli_args.ipv6))
-            .next()
+            .find(|a| (a.is_ipv4() && cli_args.ipv4) || (a.is_ipv6() && cli_args.ipv6))
             .ok_or_else(|| error!("No address resolved"))?;
 
         // Connect to server
         let port = match &address {
-            V6(_) => port_v6,
-            V4(_) => port_v4,
+            SocketAddr::V6(_) => port_v6,
+            SocketAddr::V4(_) => port_v4,
         };
         let socket = util::new_socket_in_domain(&address, port)?;
         let stream = select! {
@@ -127,8 +124,8 @@ async fn start() -> Result<(), ()> {
             }
 
             let last_address = match &address {
-                V6(_) => &mut last_address_v6,
-                V4(_) => &mut last_address_v4,
+                SocketAddr::V6(_) => &mut last_address_v6,
+                SocketAddr::V4(_) => &mut last_address_v4,
             };
 
             if let Some(ref last_address) = last_address {

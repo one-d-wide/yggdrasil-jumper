@@ -42,20 +42,12 @@ pub async fn try_session(
         let addresses = state.watch_external.borrow();
         (
             if config.allow_ipv6 {
-                addresses
-                    .iter()
-                    .map(|a| a.external)
-                    .filter(|a| a.is_ipv6())
-                    .next()
+                addresses.iter().map(|a| a.external).find(|a| a.is_ipv6())
             } else {
                 None
             },
             if config.allow_ipv4 {
-                addresses
-                    .iter()
-                    .map(|a| a.external)
-                    .filter(|a| a.is_ipv4())
-                    .next()
+                addresses.iter().map(|a| a.external).find(|a| a.is_ipv4())
             } else {
                 None
             },
@@ -131,10 +123,9 @@ pub async fn try_session(
     .map_err(map_info!("Failed to prarse peer's external addresses"))?;
 
     // 6. Validate external addresses.
-    use SocketAddr::*;
     match (external, remote_external) {
-        (V6(_), V6(_)) => (),
-        (V4(_), V4(_)) => (),
+        (SocketAddr::V6(_), SocketAddr::V6(_)) => (),
+        (SocketAddr::V4(_), SocketAddr::V4(_)) => (),
         _ => {
             info!("External addresses have incompatible ranges: self {external:?}, remote {remote_external:?}");
             return Err(());
@@ -149,39 +140,22 @@ pub async fn try_session(
         .watch_external
         .borrow()
         .iter()
-        .filter(|addr| &addr.external == &external)
-        .next()
+        .find(|addr| addr.external == external)
         .ok_or_else(|| info!("Expected external address unavailible: {external}"))?
         .local;
     let remote = remote_external;
 
-    info!("Trying NAT traversal from {local} to {remote}");
-    let mut last_err: Option<std::io::Result<TcpStream>> = None;
-    for _ in 0..config.nat_traversal_retry_count {
-        // Check if bridge was already instantiated
-        if let Some(sessions::SessionType::Bridge) =
-            state.active_sessions.read().await.get(address.ip())
-        {
-            break;
-        }
-        {
-            select! {
-                err = util::new_socket_in_domain(&local, local.port())?.connect(remote) => { last_err = Some(err); },
-                _ = sleep(config.nat_traversal_connection_timeout) => {},
-            }
-            if let Some(Ok(_)) = last_err {
-                break;
-            }
-        }
-        sleep(config.nat_traversal_connection_delay).await;
-    }
-    match last_err {
-        Some(Ok(socket)) => {
-            return bridge::run_bridge(config, state, remote, Some(address.ip().clone()), socket)
-                .await
-        }
-        Some(Err(err)) => info!("Failed: {err}"),
-        None => info!("Failed: Timeout"),
+    if let Ok(socket) = internet::traverse(
+        config.clone(),
+        state.clone(),
+        local.port(),
+        remote,
+        Some(*address.ip()),
+    )
+    .await
+    .map_err(map_info!("NAT traversal failed"))
+    {
+        return bridge::run_bridge(config, state, remote, Some(*address.ip()), socket).await;
     }
     Err(())
 }

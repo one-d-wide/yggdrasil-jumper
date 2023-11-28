@@ -38,7 +38,7 @@ pub async fn connect(config: Config) -> Result<Endpoint<util::RWSocket>, ()> {
                     let build_version = info.build_version;
                     let versions: Vec<u64> = build_version
                         .as_str()
-                        .split(".")
+                        .split('.')
                         .filter_map(|v| v.parse().ok())
                         .collect();
                     if versions.len() != 3 {
@@ -47,15 +47,14 @@ pub async fn connect(config: Config) -> Result<Endpoint<util::RWSocket>, ()> {
                     }
 
                     // If router version is lower then v0.4.5
-                    if versions[0] == 0 && versions[1] <= 4 && (versions[1] < 4 || versions[2] < 5)
+                    if versions[0] == 0
+                        && versions[1] <= 4
+                        && (versions[1] < 4 || versions[2] < 5)
+                        && config.yggdrasil_listen.is_empty()
                     {
-                        if config.yggdrasil_listen.is_empty() {
-                            warn!("Direct bridges can't be connected to the router of version {build_version} at {uri}");
-                            warn!(
-                                "Routers prior to v0.4.5 (Oct 2022) don't support addpeer/removepeer commands"
-                            );
-                            warn!("Help: Specify `ygdrasil_addresses` in the config or update your router");
-                        }
+                        warn!("Direct bridges can't be connected to the router of version {build_version} at {uri}");
+                        warn!("Routers prior to v0.4.5 (Oct 2022) don't support addpeer/removepeer commands");
+                        warn!("Help: Specify `yggdrasil_addresses` in the config or update your router");
                     }
 
                     return Ok(endpoint);

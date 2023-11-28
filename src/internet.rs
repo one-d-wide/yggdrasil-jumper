@@ -51,7 +51,7 @@ pub async fn listen(config: Config, state: State, listeners: Vec<TcpListener>) -
     }
 
     // Create await pool
-    let mut pool: FuturesUnordered<_> = listeners.into_iter().map(|l| listen(l)).collect();
+    let mut pool: FuturesUnordered<_> = listeners.into_iter().map(listen).collect();
 
     loop {
         // Accept every incoming connection
@@ -72,5 +72,40 @@ pub async fn listen(config: Config, state: State, listeners: Vec<TcpListener>) -
             None,
             socket,
         ));
+    }
+}
+
+pub async fn traverse(
+    config: Config,
+    state: State,
+    local: u16,
+    remote: SocketAddr,
+    monitor_addr: Option<Ipv6Addr>,
+) -> IoResult<TcpStream> {
+    let mut last_err: Option<std::io::Result<TcpStream>> = None;
+    for _ in 0..config.nat_traversal_retry_count {
+        // Check if bridge was already instantiated
+        if let Some(ref monitor_addr) = monitor_addr {
+            if let Some(sessions::SessionType::Bridge) =
+                state.active_sessions.read().await.get(monitor_addr)
+            {
+                break;
+            }
+        }
+        {
+            select! {
+                err = util::new_socket_in_domain(&remote, local)
+                    .map_err(|_| IoError::last_os_error())?.connect(remote) => { last_err = Some(err); },
+                _ = sleep(config.nat_traversal_connection_timeout) => {},
+            }
+            if let Some(Ok(_)) = last_err {
+                break;
+            }
+        }
+        sleep(config.nat_traversal_connection_delay).await;
+    }
+    match last_err {
+        Some(res) => res,
+        None => Err(IoError::new(IoErrorKind::TimedOut, "Timeout")),
     }
 }

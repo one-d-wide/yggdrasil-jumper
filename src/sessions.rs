@@ -8,41 +8,28 @@ pub enum SessionType {
 
 impl SessionType {
     pub fn is_bridge(&self) -> bool {
-        match self {
-            Self::Bridge => true,
-            _ => false,
-        }
+        matches!(self, Self::Bridge)
     }
     pub fn is_session(&self) -> bool {
-        match self {
-            Self::Session => true,
-            _ => false,
-        }
+        matches!(self, Self::Session)
     }
 }
 
 #[instrument(parent = None, name = "Session ", skip_all, fields(peer = %address))]
 async fn connect_session(config: Config, state: State, address: SocketAddrV6) -> Result<(), ()> {
     let remote = SocketAddr::V6(address);
-    debug!("Firewall traversal");
 
-    let mut last_err: Option<std::io::Result<TcpStream>> = None;
-    for _ in 0..config.nat_traversal_retry_count {
-        {
-            select! {
-                err = util::new_socket_ipv6(config.listen_port)?.connect(remote) => { last_err = Some(err); },
-                _ = sleep(config.nat_traversal_connection_timeout) => {},
-            }
-            if let Some(Ok(_)) = last_err {
-                break;
-            }
-        }
-        sleep(config.nat_traversal_connection_delay).await;
-    }
-    match last_err {
-        Some(Ok(socket)) => return protocol::try_session(config, state, socket, address).await,
-        Some(Err(err)) => debug!("Failed: {err}"),
-        None => debug!("Failed: Timeout"),
+    if let Ok(socket) = internet::traverse(
+        config.clone(),
+        state.clone(),
+        config.listen_port,
+        remote,
+        Some(*address.ip()),
+    )
+    .await
+    .map_err(map_debug!("Firewall traversal failed"))
+    {
+        return protocol::try_session(config, state, socket, address).await;
     }
     Err(())
 }
@@ -80,32 +67,34 @@ pub async fn spawn_new_sessions(
             for (address, uptime) in watch_sessions
                 .borrow_and_update()
                 .iter()
-                .map(|s| (s.address.clone(), s.uptime))
+                .map(|s| (s.address, s.uptime))
             {
                 // Skip if address is not in the whitelist
                 if let Some(false) = config.whitelist.as_ref().map(|w| w.contains(&address)) {
                     continue;
                 }
                 // Spawn handler if session is new
-                if let None = sessions.get(&address) {
+                if sessions.get(&address).is_none() {
                     is_new_session_spawned = true;
 
                     // Add session record
-                    sessions.insert(address.clone(), SessionType::Session);
+                    sessions.insert(address, SessionType::Session);
 
                     // Spawn session handler
                     let (config, state) = (config.clone(), state.clone());
                     spawn(async move {
                         // Align connection time with session's uptime for firewall traversal effect
-                        // Sleep untill uptime value is dividable by `protocol::ALIGN_UPTIME_TIMEOUT`
-                        let delay = if uptime != 0.0 {
-                            (uptime / protocol::ALIGN_UPTIME_TIMEOUT).ceil()
-                                * protocol::ALIGN_UPTIME_TIMEOUT
-                                - uptime
-                        } else {
+                        // Sleep until uptime value is dividable by `protocol::ALIGN_UPTIME_TIMEOUT`
+                        let delay = match uptime {
+                            Some(uptime) => {
+                                (uptime / protocol::ALIGN_UPTIME_TIMEOUT).ceil()
+                                    * protocol::ALIGN_UPTIME_TIMEOUT
+                                    - uptime
+                            },
                             // Uptime unknown. Prevent request flood
-                            protocol::ALIGN_UPTIME_TIMEOUT
+                            None => protocol::ALIGN_UPTIME_TIMEOUT,
                         };
+                        debug!("delay: {delay}");
 
                         sleep(Duration::from_secs_f64(delay)).await;
 
@@ -113,7 +102,7 @@ pub async fn spawn_new_sessions(
                         let _ = connect_session(
                             config.clone(),
                             state.clone(),
-                            SocketAddrV6::new(address.clone(), config.listen_port, 0, 0),
+                            SocketAddrV6::new(address, config.listen_port, 0, 0),
                         )
                         .await;
 

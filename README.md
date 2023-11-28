@@ -80,7 +80,7 @@ $ yggdrasil-jumper --config <path> # standard input will be read if path is "-"
 
 In order to know what address to use with [NAT traversal], jumper must know self external internet address and port. This task is performed using [STUN] protocol with TCP extension, hence not every [STUN] server is supported. [STUN] standard is quite broad, but jumper utilities only address lookup feature.
 
-You can check compatibility with `stun-tcp` binary from this repository.
+You can check compatibility using `stun-tcp` binary from this repository.
 
 ```shell
 $ cargo build --bin stun-tcp --release

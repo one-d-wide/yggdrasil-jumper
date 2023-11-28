@@ -89,7 +89,7 @@ impl ConfigInner {
         };
         let config: Self =
             toml::from_str(config.as_str()).map_err(map_error!("Failed to parse config"))?;
-        Ok(config.verify()?)
+        config.verify()
     }
 
     fn verify(self) -> Result<Self, ()> {
@@ -107,8 +107,7 @@ impl ConfigInner {
 
 fn parse_duration<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     use serde::de::Error;
-    Duration::try_from_secs_f64(Deserialize::deserialize(deserializer)?)
-        .map_err(|e| D::Error::custom(e))
+    Duration::try_from_secs_f64(Deserialize::deserialize(deserializer)?).map_err(D::Error::custom)
 }
 
 #[cfg(test)]

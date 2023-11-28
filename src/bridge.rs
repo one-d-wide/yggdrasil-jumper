@@ -24,9 +24,9 @@ async fn bridge(
         loop {
             if ! recorded {
                 if let Some(ref addr) = address {
-                    let old = state.active_sessions.write().await.insert(addr.clone(), Bridge);
-                    use sessions::SessionType::*;
-                    if let Some(Bridge) = old {
+                    use sessions::SessionType;
+                    let old = state.active_sessions.write().await.insert(*addr, SessionType::Bridge);
+                    if let Some(SessionType::Bridge) = old {
                         // Multiple connections with the same identifiers are not allowed by the OS.
                         warn!("Bridge already exists. Implementation bug");
                         return Err(());
@@ -77,23 +77,22 @@ async fn bridge(
                     }
 
                     // Return if peer is not connected
-                    if delay_shutdown.is_none() {
-                        if ! peers.iter().any(|peer| &peer.remote == &uri) {
-                            return Err(info!("Bridge is not connected as peer"));
-                        }
+                    if delay_shutdown.is_none() && !peers.iter().filter_map(|peer| peer.remote.as_ref()).any(|remote| remote == &uri) {
+                        return Err(info!("Bridge is not connected as peer"));
                     }
-                    // Retreive address
+                    // Retrieve address
                     if address.is_none() {
                         for peer in peers.iter() {
-                            if &peer.remote == &uri {
-                                let addr = peer.address;
-                                *address = Some(addr);
-                                info!("Peer address instantiated");
-                                if let Some(false) = config.whitelist.as_ref().map(|w| w.contains(&addr)) {
-                                    info!("Peer misses whitelist");
-                                    return Ok(())
+                            if peer.remote.as_deref() == Some(&uri) {
+                                if let Some(addr) = peer.address {
+                                    *address = Some(addr);
+                                    info!("Peer address instantiated");
+                                    if let Some(false) = config.whitelist.as_ref().map(|w| w.contains(&addr)) {
+                                        info!("Peer misses whitelist");
+                                        return Ok(())
+                                    }
+                                    break;
                                 }
-                                break;
                             }
                         }
                     }
@@ -132,11 +131,11 @@ pub async fn run_bridge(
     let uri = |local_addr: std::io::Result<SocketAddr>| -> Result<String, ()> {
         Ok(format!(
             "tcp://{}",
-            local_addr.map_err(map_warn!("Failed to retreive local inbound socket address"))?
+            local_addr.map_err(map_warn!("Failed to retrieve local inbound socket address"))?
         ))
     };
 
-    // Try connect self to ygdrasil listen addresses directly
+    // Try connect self to yggdrasil listen addresses directly
     for addr in &config.yggdrasil_listen {
         if let Ok(ygg) = TcpStream::connect(addr).await.map_err(map_warn!(
             "Failed to connect to yggdrasil listen socket at {addr}"
@@ -147,10 +146,10 @@ pub async fn run_bridge(
         }
     }
 
-    // Fallback. Try connect ygdrasil to self
+    // Fallback. Try connect yggdrasil to self
     let socket_address = socket
         .local_addr()
-        .map_err(map_warn!("Failed to retreive local socket address"))?;
+        .map_err(map_warn!("Failed to retrieve local socket address"))?;
     let ygg = util::new_socket_in_domain(&socket_address, 0)?
         .listen(1)
         .map_err(map_warn!("Failed to create local inbound socket"))?;

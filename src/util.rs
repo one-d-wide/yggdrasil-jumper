@@ -13,22 +13,20 @@ pub fn new_socket_ipv4(port: u16) -> Result<TcpSocket, ()> {
 }
 
 pub fn new_socket_in_domain(domain: &SocketAddr, port: u16) -> Result<TcpSocket, ()> {
-    use SocketAddr::*;
     match domain {
-        V4(_) => new_socket_ipv4(port),
-        V6(_) => new_socket_ipv6(port),
+        SocketAddr::V4(_) => new_socket_ipv4(port),
+        SocketAddr::V6(_) => new_socket_ipv6(port),
     }
 }
 
 #[instrument(name = " New socket ", skip_all, fields(address = %address))]
 fn new_socket(address: SocketAddr) -> Result<TcpSocket, ()> {
-    use SocketAddr::*;
     let map_err = map_error!("Failed to crate socket");
 
     let socket = Socket::new(
         match address {
-            V4(_) => Domain::IPV4,
-            V6(_) => Domain::IPV6,
+            SocketAddr::V4(_) => Domain::IPV4,
+            SocketAddr::V6(_) => Domain::IPV6,
         },
         Type::STREAM,
         Some(Protocol::TCP),
