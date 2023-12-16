@@ -1,7 +1,13 @@
 use super::*;
 
+pub struct RouterState {
+    pub version: [u64; 3],
+    pub address: Ipv6Addr,
+    pub admin_api: Endpoint<utils::RWSocket>,
+}
+
 #[instrument(parent = None, name = "Admin API", skip_all)]
-pub async fn connect(config: Config) -> Result<Endpoint<util::RWSocket>, ()> {
+pub async fn connect(config: Config) -> Result<RouterState, ()> {
     use std::io::{Error, ErrorKind};
     let error = |t| Error::new(ErrorKind::InvalidInput, t);
 
@@ -13,14 +19,14 @@ pub async fn connect(config: Config) -> Result<Endpoint<util::RWSocket>, ()> {
                 #[cfg(unix)]
                 "unix" => tokio::net::UnixStream::connect(address)
                     .await
-                    .map(|s| -> util::RWSocket { Box::new(s) }),
+                    .map(|s| -> utils::RWSocket { Box::new(s) }),
                 #[cfg(not(unix))]
                 "unix" => Err(error(format!(
                     "Unix socket is not supported on this platform"
                 ))),
                 "tcp" => TcpStream::connect(address)
                     .await
-                    .map(|s| -> util::RWSocket { Box::new(s) }),
+                    .map(|s| -> utils::RWSocket { Box::new(s) }),
                 _ => Err(error(format!("Invalid protocol '{protocol}'"))),
             };
             match socket {
@@ -36,20 +42,25 @@ pub async fn connect(config: Config) -> Result<Endpoint<util::RWSocket>, ()> {
                         .map_err(map_error!("Failed to query admin api response"))?
                         .map_err(map_error!("Command 'getself' failed"))?;
                     let build_version = info.build_version;
-                    let versions: Vec<u64> = build_version
+                    let version: Vec<u64> = build_version
                         .as_str()
-                        .split('.')
+                        .split(['.', '-'].as_slice())
+                        .take(3)
                         .filter_map(|v| v.parse().ok())
                         .collect();
-                    if versions.len() != 3 {
-                        error!("Failed to parse router version {versions:?}");
-                        continue;
-                    }
+
+                    let version: [u64; 3] = match version.try_into() {
+                        Ok(version) => version,
+                        Err(_) => {
+                            error!("Failed to parse router version '{build_version}'");
+                            continue;
+                        }
+                    };
 
                     // If router version is lower then v0.4.5
-                    if versions[0] == 0
-                        && versions[1] <= 4
-                        && (versions[1] < 4 || versions[2] < 5)
+                    if version[0] == 0
+                        && version[1] <= 4
+                        && (version[1] < 4 || version[2] < 5)
                         && config.yggdrasil_listen.is_empty()
                     {
                         warn!("Direct bridges can't be connected to the router of version {build_version} at {uri}");
@@ -57,7 +68,43 @@ pub async fn connect(config: Config) -> Result<Endpoint<util::RWSocket>, ()> {
                         warn!("Help: Specify `yggdrasil_addresses` in the config or update your router");
                     }
 
-                    return Ok(endpoint);
+                    // If router version is lower then v0.5.0 and quic protocol is specified
+                    if config
+                        .yggdrasil_protocols
+                        .iter()
+                        .any(|p| *p == PeeringProtocol::Quic)
+                    {
+                        if version[0] == 0 && version[1] < 5 {
+                            warn!("Transport protocol Quic is not supported by the router of version {build_version} at {uri}");
+                        }
+                    }
+
+                    // If any client-server peering protocol doesn't have `listen` peer listed
+                    for protocol in config
+                        .yggdrasil_protocols
+                        .iter()
+                        .filter(|p| **p != PeeringProtocol::Tcp)
+                    {
+                        if !config
+                            .yggdrasil_listen
+                            .iter()
+                            .filter_map(|a| {
+                                a.split("://")
+                                    .next()
+                                    .and_then(|p| PeeringProtocol::from_str(p).ok())
+                            })
+                            .any(|p| p == *protocol)
+                        {
+                            warn!("Transport protocol {protocol:?} is client-server only and it is unable to create peering");
+                            warn!("If both peering nodes have no appropriate `yggdrasil_listen` URI set in the config");
+                        }
+                    }
+
+                    return Ok(RouterState {
+                        version,
+                        address: info.address,
+                        admin_api: endpoint,
+                    });
                 }
             }
         } else {
@@ -72,7 +119,7 @@ pub async fn connect(config: Config) -> Result<Endpoint<util::RWSocket>, ()> {
 }
 
 #[instrument(parent = None, name = "Admin API watcher", skip_all)]
-pub async fn watcher(
+pub async fn monitor(
     config: Config,
     state: State,
     watch_sessions: watch::Sender<Vec<yggdrasilctl::SessionEntry>>,
@@ -84,7 +131,8 @@ pub async fn watcher(
         {
             let io_err = map_error!("Failed to query admin api");
             let api_err = map_error!("Admin api returned error");
-            let mut endpoint = state.admin.write().await;
+
+            let endpoint = &mut state.router.write().await.admin_api;
 
             watch_sessions
                 .send(

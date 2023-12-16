@@ -65,7 +65,7 @@ jobs:
         run: |
           mkdir -p output
           mv "target/${{ matrix.target }}/release/yggdrasil-jumper${{ matrix.output_postfix }}" "output/yggdrasil-jumper-${{ matrix.output_target }}${{ matrix.output_postfix }}"
-          mv "target/${{ matrix.target }}/release/stun-tcp${{ matrix.output_postfix }}" "output/stun-tcp-${{ matrix.output_target }}${{ matrix.output_postfix }}"
+          mv "target/${{ matrix.target }}/release/stun-test${{ matrix.output_postfix }}" "output/stun-test-${{ matrix.output_target }}${{ matrix.output_postfix }}"
 
       - name: Upload
         uses: softprops/action-gh-release@v1

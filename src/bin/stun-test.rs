@@ -1,7 +1,7 @@
 use yggdrasil_jumper::*;
 
-#[derive(clap::Parser)]
-#[command(name = "stun-tcp", version)]
+#[derive(Debug, clap::Parser)]
+#[command(name = "stun-test", version)]
 pub struct CliArgs {
     #[arg(required_unless_present_any = [ "config", "default" ])]
     pub servers: Vec<String>,
@@ -13,12 +13,19 @@ pub struct CliArgs {
     pub loglevel: LevelFilter,
     #[arg(long = "no-color", help = "Whether to disable auto coloring", action = clap::ArgAction::SetFalse)]
     pub use_color: bool,
-    #[arg(short = '6', long, help = "Use only IPv6")]
+    #[arg(short = '6', long, help = "Use only IPv6", conflicts_with = "ipv4")]
     pub ipv6: bool,
     #[arg(short = '4', long, help = "Use only IPv4")]
+    #[arg(conflicts_with = "ipv6", default_value = "true")]
     pub ipv4: bool,
+    #[arg(short = 't', long, help = "Use only TCP")]
+    #[arg(required_unless_present = "udp", conflicts_with = "udp")]
+    pub tcp: bool,
+    #[arg(short = 'u', long, help = "Use only UDP")]
+    #[arg(required_unless_present = "tcp", conflicts_with = "tcp")]
+    pub udp: bool,
     #[arg(long, help = "Print server for every resolved address")]
-    pub print_server: bool,
+    pub print_servers: bool,
     #[arg(long = "no-check", help = "Skip all address consistency checks", action = clap::ArgAction::SetFalse)]
     pub check: bool,
 }
@@ -32,11 +39,6 @@ async fn start() -> Result<(), ()> {
     // Parse CLI arguments
     let mut cli_args: CliArgs = clap::Parser::try_parse().map_err(|e| e.exit())?;
 
-    if cli_args.ipv6 == cli_args.ipv4 {
-        cli_args.ipv6 = true;
-        cli_args.ipv4 = true;
-    }
-
     // Init logger
     tracing_subscriber::fmt()
         .with_target(false)
@@ -44,7 +46,7 @@ async fn start() -> Result<(), ()> {
         .with_thread_names(false)
         .with_ansi(
             cli_args.use_color
-                && atty::is(atty::Stream::Stdout)
+                && std::io::IsTerminal::is_terminal(&std::io::stdout())
                 && std::env::var_os("TERM").is_some(),
         )
         .with_max_level(cli_args.loglevel)
@@ -53,29 +55,35 @@ async fn start() -> Result<(), ()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Find availible ports
-    let (mut port_v4, mut port_v6) = (0, 0);
-    {
-        let port_of = |socket: TcpSocket| {
-            let port = socket
-                .local_addr()
-                .map_err(map_error!("Failed to retreive local socket address"))?
-                .port();
-            Ok(port)
-        };
-        if cli_args.ipv6 {
-            port_v6 = port_of(util::new_socket_ipv6(0)?)?;
-        }
-        if cli_args.ipv4 {
-            port_v4 = port_of(util::new_socket_ipv4(0)?)?;
-        }
+    // Allocate socket port
+    if cli_args.ipv6 {
+        cli_args.ipv4 = false;
     }
+    let ip_domain: IpAddr = if cli_args.ipv6 {
+        Ipv6Addr::UNSPECIFIED.into()
+    } else {
+        Ipv4Addr::UNSPECIFIED.into()
+    };
+
+    let local_address = SocketAddr::from((ip_domain, 0));
+    let local_address = if cli_args.tcp {
+        utils::create_tcp_socket(local_address)?.local_addr()
+    } else {
+        utils::create_udp_socket(local_address)?.local_addr()
+    }
+    .map_err(map_error!("Failed to retrieve local socket address"))?;
+
+    // Load config
+    let config = Arc::new(match cli_args.config {
+        Some(ref path) => config::ConfigInner::read(path.as_path())?,
+        None => config::ConfigInner::default(),
+    });
 
     // Load server list
-    if let Some(path) = cli_args.config {
+    if cli_args.config.is_some() {
         cli_args
             .servers
-            .append(&mut config::ConfigInner::read(path.as_path())?.stun_servers);
+            .clone_from_slice(config.stun_servers.as_slice());
     }
 
     if cli_args.default {
@@ -84,62 +92,43 @@ async fn start() -> Result<(), ()> {
             .append(&mut config::ConfigInner::default().stun_servers);
     }
 
-    let mut last_address_v4 = None;
-    let mut last_address_v6 = None;
-
+    let mut last_address = None;
     for server in cli_args.servers {
         let _span = error_span!("While resolving ", server = %server);
         let _span = _span.enter();
 
-        // Lookup server address
-        let address = lookup_host(server.as_str())
-            .await
-            .map_err(map_error!("Failed to lookup host"))?
-            .find(|a| (a.is_ipv4() && cli_args.ipv4) || (a.is_ipv6() && cli_args.ipv6))
-            .ok_or_else(|| error!("No address resolved"))?;
-
         // Connect to server
-        let port = match &address {
-            SocketAddr::V6(_) => port_v6,
-            SocketAddr::V4(_) => port_v4,
+        let protocol = if cli_args.tcp {
+            NetworkProtocol::Tcp
+        } else {
+            NetworkProtocol::Udp
         };
-        let socket = util::new_socket_in_domain(&address, port)?;
-        let stream = select! {
-            stream = socket.connect(address) => stream.map_err(map_error!("Failed to connect"))?,
-            _ = sleep(Duration::from_secs(10)) => { error!("Timeout"); return Err(()); },
-        };
-        let mut stream = BufReader::new(stream);
-
-        // Request external address
-        let external_address = stun::lookup_external_address(&mut stream).await?;
+        let external_address = stun::lookup(config.clone(), protocol, local_address, &server)
+            .await?
+            .external;
 
         // Check address consistency
         if cli_args.check {
             let _span = error_span!(" ", received = %external_address);
             let _span = _span.enter();
 
-            if external_address.is_ipv4() != address.is_ipv4() {
+            if external_address.is_ipv4() != local_address.is_ipv4() {
                 error!("Resolved address has wrong range");
                 return Err(());
             }
 
-            let last_address = match &address {
-                SocketAddr::V6(_) => &mut last_address_v6,
-                SocketAddr::V4(_) => &mut last_address_v4,
-            };
-
             if let Some(ref last_address) = last_address {
                 if last_address != &external_address {
-                    error!("Previously resolved addresses do not match");
+                    error!("Previously resolved addresses don't match");
                     return Err(());
                 }
             } else {
-                *last_address = Some(external_address);
+                last_address = Some(external_address);
             }
         }
 
         // Print resolved address
-        if cli_args.print_server {
+        if cli_args.print_servers {
             print!("{server} ");
         }
         println!("{external_address}");
