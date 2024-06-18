@@ -53,26 +53,28 @@ pub async fn setup_listeners(
 ) -> Result<(), ()> {
     pub async fn handle_active_tcp_socket(
         config: &Config,
-        state: State,
+        state: &State,
         socket: TcpStream,
         address: SocketAddr,
     ) {
+        // Set timer to automatically remove connected socket from the list
+        let delay = config.socket_inactivity_cleanup_delay;
+        let abort_handle = spawn({
+            let state = state.clone();
+            async move {
+                sleep(delay).await;
+                state.active_sockets_tcp.write().await.remove(&address);
+            }
+        })
+        .abort_handle();
+        let abort_guard = defer_arg(abort_handle, |h| h.abort());
+
         // Add connected socket to the list
         state
             .active_sockets_tcp
             .write()
             .await
-            .insert(address, socket);
-
-        // Set timer to automatically remove connected socket from the list
-        let delay = config.socket_inactivity_cleanup_delay;
-        spawn(async move {
-            select! {
-                _ = sleep(delay) => {},
-                _ = state.cancellation.cancelled() => { return; },
-            }
-            state.active_sockets_tcp.write().await.remove(&address);
-        });
+            .insert(address, (socket, abort_guard));
     }
 
     let mut tasks = JoinSet::new();
@@ -84,14 +86,15 @@ pub async fn setup_listeners(
         tasks.spawn(async move {
             loop {
                 // Accept connection
-                let (socket, address) = select! {
-                    result = listener.accept() => result,
-                    _ = state.cancellation.cancelled() => return Ok(()),
-                }
-                .map_err(map_error!("Failed to accept incoming connection"))?;
+                let (socket, address) = listener
+                    .accept()
+                    .await
+                    .map_err(map_error!("Failed to accept incoming connection"))?;
+
+                debug!("Incoming connection received from: {address}");
 
                 // Save connection to the list
-                handle_active_tcp_socket(&config, state.clone(), socket, address).await;
+                handle_active_tcp_socket(&config, &state, socket, address).await;
             }
         });
     }
@@ -105,11 +108,12 @@ pub async fn setup_listeners(
     tasks.spawn(async move {
         loop {
             // Accept every incoming connection
-            let (socket, address) = select! {
-                result = socket.accept() => result,
-                _ = state.cancellation.cancelled() => return Ok(()),
-            }
-            .map_err(map_error!("Failed to accept incoming connection"))?;
+            let (socket, address) = socket
+                .accept()
+                .await
+                .map_err(map_error!("Failed to accept incoming connection"))?;
+
+            debug!("Incoming connection received from: {address} (yggdrasil)");
 
             // Skip if connection isn't ipv6
             if !address.is_ipv6() {
@@ -121,7 +125,7 @@ pub async fn setup_listeners(
                 continue;
             }
 
-            handle_active_tcp_socket(&config, state.clone(), socket, address).await;
+            handle_active_tcp_socket(&config, &state, socket, address).await;
         }
     });
 
@@ -129,7 +133,7 @@ pub async fn setup_listeners(
 }
 
 /// Try NAT traversal
-#[instrument(name = " NAT traversal", skip_all, fields(protocol = ?protocol, remote = %remote))]
+#[instrument(name = "NAT traversal", skip_all, fields(protocol = ?protocol, remote = %remote))]
 pub async fn traverse(
     config: Config,
     state: State,
@@ -139,47 +143,63 @@ pub async fn traverse(
     _monitor_addr: Ipv6Addr,
     mut notify_traversed: Option<oneshot::Sender<()>>,
     mut check_traversed: Option<oneshot::Receiver<()>>,
-) -> IoResult<RouterStream> {
+) -> IoResult<IoResult<RouterStream>> {
     debug!("Started");
-
-    let cancellation = state.cancellation.clone();
 
     match protocol {
         // Use TCP
         PeeringProtocol::Tcp | PeeringProtocol::Tls => {
-            let mut last_err = None;
+            let mut last_result = None;
             for _ in 0..config.nat_traversal_tcp_retry_count {
+                let delay = sleep(config.nat_traversal_tcp_cycle);
+
                 // Check if TCP stream was already received
                 if state.active_sockets_tcp.read().await.contains_key(&remote) {
-                    let entry = state
+                    let (_, (socket, _)) = state
                         .active_sockets_tcp
                         .write()
                         .await
                         .remove_entry(&remote)
                         .unwrap();
 
-                    last_err = Some(Ok(entry.1));
+                    last_result = Some(Ok(socket));
                     break;
                 } else {
                     // Try start new connection
                     let socket = utils::create_tcp_socket_in_domain(&remote, local_port)
                         .map_err(|_| IoError::last_os_error())?;
 
-                    if let Ok(err) =
-                        timeout(config.nat_traversal_tcp_timeout, socket.connect(remote)).await
+                    #[cfg(target_os = "linux")]
                     {
-                        last_err = Some(err);
+                        SockRef::from(&socket)
+                            .set_tcp_user_timeout(Some(config.nat_traversal_tcp_timeout))?;
+
+                        last_result = Some(socket.connect(remote).await);
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        select! {
+                            _ = sleep(config.nat_traversal_tcp_timeout) => {
+                                last_result = Some(Err(IoErrorKind::TimedOut.into()));
+                            },
+                            res = socket.connect(remote) => {
+                                last_result = Some(res);
+                            }
+                        };
+                    }
+                    if let Some(Ok(_)) = last_result {
                         break;
                     }
                 }
-                if cancellation.is_cancelled() {
-                    break;
-                }
-                sleep(config.nat_traversal_tcp_delay).await;
+                delay.await;
             }
-            match last_err {
-                Some(res) => res.map(|s| s.into()),
-                None => Err(IoError::new(IoErrorKind::TimedOut, "Timeout")),
+            match last_result {
+                Some(res) => Ok(res.map(|s| {
+                    #[cfg(target_os = "linux")]
+                    SockRef::from(&s).set_tcp_user_timeout(None).ok();
+                    s.into()
+                })),
+                None => Ok(Err(IoError::new(IoErrorKind::TimedOut, "Timeout"))),
             }
         }
         // Use UDP
@@ -192,8 +212,10 @@ pub async fn traverse(
                 .await
                 .map_err(|_| IoError::last_os_error())?;
 
-            let mut last_err = None;
+            let mut last_result = None;
             for _ in 0..config.nat_traversal_udp_retry_count {
+                let delay = sleep(config.nat_traversal_udp_cycle);
+
                 socket.send(NAT_TRAVERSAL_HELLO.as_bytes()).await?;
 
                 select! {
@@ -209,7 +231,7 @@ pub async fn traverse(
                                 }
                             }
                         }
-                    } => { last_err = Some(err); },
+                    } => { last_result = Some(err); },
                     _ = sleep(config.nat_traversal_udp_timeout) => {},
                 }
 
@@ -219,22 +241,19 @@ pub async fn traverse(
                         .map(|c| c.try_recv().is_ok())
                         .unwrap_or(false)
                 {
-                    last_err = Some(Ok(()));
+                    last_result = Some(Ok(()));
                 }
 
-                if let Some(Ok(_)) = last_err {
-                    break;
-                }
-                if cancellation.is_cancelled() {
+                if let Some(Ok(_)) = last_result {
                     break;
                 }
 
-                sleep(config.nat_traversal_udp_delay).await;
+                delay.await;
             }
 
-            match last_err {
-                Some(res) => res.map(|_| socket.into()),
-                None => Err(IoError::new(IoErrorKind::TimedOut, "Timeout")),
+            match last_result {
+                Some(res) => Ok(res.map(|_| socket.into())),
+                None => Ok(Err(IoError::new(IoErrorKind::TimedOut, "Timeout"))),
             }
         }
     }

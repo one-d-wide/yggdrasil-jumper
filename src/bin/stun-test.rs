@@ -28,6 +28,8 @@ pub struct CliArgs {
     pub print_servers: bool,
     #[arg(long = "no-check", help = "Skip all address consistency checks", action = clap::ArgAction::SetFalse)]
     pub check: bool,
+    #[arg(long = "fail-fast", help = "Exit immediately if resolution fails")]
+    pub fail_fast: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -94,44 +96,52 @@ async fn start() -> Result<(), ()> {
 
     let mut last_address = None;
     for server in cli_args.servers {
-        let _span = error_span!("While resolving ", server = %server);
-        let _span = _span.enter();
-
-        // Connect to server
-        let protocol = if cli_args.tcp {
-            NetworkProtocol::Tcp
-        } else {
-            NetworkProtocol::Udp
-        };
-        let external_address = stun::lookup(config.clone(), protocol, local_address, &server)
-            .await?
-            .external;
-
-        // Check address consistency
-        if cli_args.check {
-            let _span = error_span!(" ", received = %external_address);
+        let result = async {
+            let _span = error_span!("While resolving ", server = %server);
             let _span = _span.enter();
 
-            if external_address.is_ipv4() != local_address.is_ipv4() {
-                error!("Resolved address has wrong range");
-                return Err(());
-            }
+            // Connect to server
+            let protocol = if cli_args.tcp {
+                NetworkProtocol::Tcp
+            } else {
+                NetworkProtocol::Udp
+            };
+            let external_address = stun::lookup(config.clone(), protocol, local_address, &server)
+                .await?
+                .external;
 
-            if let Some(ref last_address) = last_address {
-                if last_address != &external_address {
-                    error!("Previously resolved addresses don't match");
+            // Check address consistency
+            if cli_args.check {
+                let _span = error_span!(" ", received = %external_address);
+                let _span = _span.enter();
+
+                if external_address.is_ipv4() != local_address.is_ipv4() {
+                    error!("Resolved address has wrong range");
                     return Err(());
                 }
-            } else {
-                last_address = Some(external_address);
-            }
-        }
 
-        // Print resolved address
-        if cli_args.print_servers {
-            print!("{server} ");
+                if let Some(ref last_address) = last_address {
+                    if last_address != &external_address {
+                        error!("Previously resolved addresses don't match");
+                        return Err(());
+                    }
+                } else {
+                    last_address = Some(external_address);
+                }
+            }
+
+            // Print resolved address
+            if cli_args.print_servers {
+                print!("{server} ");
+            }
+            println!("{external_address}");
+
+            Ok(())
         }
-        println!("{external_address}");
+        .await;
+        if result.is_err() && cli_args.fail_fast {
+            return Err(());
+        }
     }
     Ok(())
 }

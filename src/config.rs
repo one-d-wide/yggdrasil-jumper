@@ -18,13 +18,13 @@ pub struct ConfigInner {
     // Fields below are not listed in example config
     pub nat_traversal_tcp_retry_count: u64,
     #[serde(deserialize_with = "parse_duration")]
-    pub nat_traversal_tcp_delay: Duration,
+    pub nat_traversal_tcp_cycle: Duration,
     #[serde(deserialize_with = "parse_duration")]
     pub nat_traversal_tcp_timeout: Duration,
 
     pub nat_traversal_udp_retry_count: u64,
     #[serde(deserialize_with = "parse_duration")]
-    pub nat_traversal_udp_delay: Duration,
+    pub nat_traversal_udp_cycle: Duration,
     #[serde(deserialize_with = "parse_duration")]
     pub nat_traversal_udp_timeout: Duration,
 
@@ -36,6 +36,7 @@ pub struct ConfigInner {
     pub stun_udp_retry_count: u64,
 
     pub avoid_redundant_peering: bool,
+    pub force_nonce_peering_password: bool,
     #[serde(deserialize_with = "parse_duration")]
     pub peer_unconnected_check_delay: Duration,
     #[serde(deserialize_with = "parse_duration")]
@@ -87,12 +88,12 @@ impl Default for ConfigInner {
             stun_servers,
 
             nat_traversal_tcp_retry_count: 5,
-            nat_traversal_tcp_delay: Duration::from_secs_f64(1.0),
-            nat_traversal_tcp_timeout: Duration::from_secs_f64(5.0),
+            nat_traversal_tcp_cycle: Duration::from_secs_f64(5.0),
+            nat_traversal_tcp_timeout: Duration::from_secs_f64(4.0),
 
             nat_traversal_udp_retry_count: 10,
-            nat_traversal_udp_delay: Duration::from_secs_f64(0.5),
-            nat_traversal_udp_timeout: Duration::from_secs_f64(0.5),
+            nat_traversal_udp_cycle: Duration::from_secs_f64(1.5),
+            nat_traversal_udp_timeout: Duration::from_secs_f64(1.0),
 
             stun_tcp_response_timeout: Duration::from_secs_f64(5.0),
 
@@ -100,6 +101,7 @@ impl Default for ConfigInner {
             stun_udp_response_timeout: Duration::from_secs_f64(4.0),
 
             avoid_redundant_peering: true,
+            force_nonce_peering_password: false,
             peer_unconnected_check_delay: Duration::from_secs_f64(15.0),
             resolve_external_address_delay: Duration::from_secs_f64(30.0),
             yggdrasilctl_query_delay: Duration::from_secs_f64(10.0),

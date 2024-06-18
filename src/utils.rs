@@ -7,5 +7,4 @@ mod sockets;
 
 pub use cancellation::*;
 pub use defer::*;
-pub use macros::*;
 pub use sockets::*;

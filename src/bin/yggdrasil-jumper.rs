@@ -23,7 +23,7 @@ async fn main() {
     err.map_err(|_| std::process::exit(1)).ok();
 }
 
-pub async fn start(cancellation: utils::CancellationUnit) -> Result<(), ()> {
+pub async fn start(cancellation: PassiveCancellationToken) -> Result<(), ()> {
     // Read CLI arguments
     let cli_args: CliArgs = clap::Parser::try_parse().unwrap_or_else(|err| err.exit());
 
@@ -39,7 +39,7 @@ pub async fn start(cancellation: utils::CancellationUnit) -> Result<(), ()> {
         .with_thread_names(false)
         .with_ansi(
             cli_args.use_color
-                && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                && std::io::stdout().is_terminal()
                 && std::env::var_os("TERM").is_some(),
         )
         .with_max_level(cli_args.loglevel)
@@ -69,7 +69,7 @@ pub async fn start(cancellation: utils::CancellationUnit) -> Result<(), ()> {
     let watch_external = watch::channel(Vec::new());
 
     let state = State::new(StateInner {
-        router: RwLock::new(router_state),
+        router: router_state,
         watch_external: watch_external.1,
         watch_sessions: watch_sessions.1,
         watch_peers: watch_peers.1,
@@ -83,6 +83,51 @@ pub async fn start(cancellation: utils::CancellationUnit) -> Result<(), ()> {
     let (external_listeners, external_addresses) =
         network::create_listener_sockets(config.clone(), state.clone())?;
 
+    let mut stop_signals = {
+        let mut signals = JoinSet::<()>::new();
+
+        signals.spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+        });
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut listen = |kind| {
+                if let Some(mut signal) = signal(kind).ok() {
+                    signals.spawn(async move {
+                        signal.recv().await;
+                    });
+                };
+            };
+
+            listen(SignalKind::interrupt());
+            listen(SignalKind::terminate());
+            listen(SignalKind::hangup());
+        }
+
+        #[cfg(windows)]
+        {
+            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+            macro_rules! listen {
+                ($signal:expr) => {
+                    if let Ok(mut signal) = $signal {
+                        signals.spawn(async move {
+                            signal.recv().await;
+                        });
+                    }
+                }
+            }
+
+            listen!(ctrl_break());
+            listen!(ctrl_c());
+            listen!(ctrl_close());
+            listen!(ctrl_shutdown());
+        }
+
+        signals
+    };
+
     select! {
         _ = spawn(network::setup_listeners(config.clone(), state.clone(), external_listeners)) => {},
         _ = spawn(stun::monitor(config.clone(), state.clone(), external_addresses, watch_external.0, external_required.1)) => {},
@@ -95,8 +140,8 @@ pub async fn start(cancellation: utils::CancellationUnit) -> Result<(), ()> {
         _ = spawn(session::spawn_new_sessions(config.clone(), state.clone(), external_required.0)) => {},
 
         _ = cancellation.cancelled() => {},
-        _ = tokio::signal::ctrl_c() => {
-            warn!("Stop signal received");
+        _ = stop_signals.join_next() => {
+            info!("Stop signal received");
             return Ok(());
         },
     }

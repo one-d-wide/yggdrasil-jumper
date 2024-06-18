@@ -1,14 +1,15 @@
 # Yggdrasil-jumper
 
-This project aims to transparently reduce latency of a connection over Yggdrasil network by on-demand establishing direct peer-to-peer connections, bypassing intermediary nodes, using NAT traversal.
+Yggdrasil-Jumper is an independent project that aims to transparently reduce latency of a connection over Yggdrasil network, utilizing NAT traversal to bypass intermediary nodes. It periodically probes for active sessions and automatically establishes direct peerings over internet with remote nodes running Yggdrasil-Jumper without requiring any firewall configuration or port mapping.
 
 ## Features
 
-* Peer-to-peer level latency for any traffic between pair of peers, running the jumper.
+* Peer-to-peer level latency for any traffic between a pair of peers, running the jumper.
+* Both TCP and UDP (QUIC) protocols are supported.
 * Automatic NAT/Firewall traversal (aka hole-punching).
-* Neither firewall configuration nor port mapping is required at all.
+* Neither firewall configuration nor port mapping is required.
 * No configuration of the jumper is required by default.
-* Transparent integration with yggdrasil router.
+* Seamless and transparent integration with yggdrasil router.
 
 ## How it works
 
@@ -49,12 +50,11 @@ yggdrasil_admin_listen = [
 #whitelist = [ ]
 ...
 # List of peering protocols
-# Supported: "tcp", "tls", "quic"
-yggdrasil_protocols = [ "tcp" ]
+# Supported are "tcp", "quic", "tls"
+yggdrasil_protocols = [ "tcp", "quic" ]
 
 # List of yggdrasil listen addresses
-# Listed in the yggdrasil config as `Listen`
-# Needed for protocols: "tls", "quic"
+# Known in the yggdrasil config as `Listen`
 yggdrasil_listen = [ ]
 ...
 # Default connect/listen port on yggdrasil network
@@ -134,11 +134,11 @@ ERROR While resolving {server=false.resolver}: {received=0.0.0.0:0}: Previously 
 <details>
 <summary>Establishing direct connection over the internet</summary>
 
-NAT traversal procedure described in [this paper](https://bford.info/pub/net/p2pnat).
+NAT traversal procedure is described in [this paper](https://bford.info/pub/net/p2pnat), here is a short summary:
 
 - Create and bind listen and connection sockets to the same port (using `SO_REUSEADDR` and `SO_REUSEPORT` flags).
 - Lookup self external address and port.
-- Exchange external addresses with peer.
+- Exchange external addresses with the peer.
 - Try to connect to the peer and listen for connection simultaneously.
 
 </details>

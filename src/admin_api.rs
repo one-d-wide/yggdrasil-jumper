@@ -1,9 +1,9 @@
 use super::*;
 
 pub struct RouterState {
-    pub version: [u64; 3],
+    pub version: yggdrasilctl::RouterVersion,
     pub address: Ipv6Addr,
-    pub admin_api: Endpoint<utils::RWSocket>,
+    pub admin_api: RwLock<Endpoint<utils::RWSocket>>,
 }
 
 #[instrument(parent = None, name = "Admin API", skip_all)]
@@ -35,37 +35,21 @@ pub async fn connect(config: Config) -> Result<RouterState, ()> {
                     info!("Connected to {uri}");
                     let mut endpoint = Endpoint::attach(socket).await;
 
-                    // Check router version
+                    // Check router info
+                    let version = endpoint.get_version();
                     let info = endpoint
                         .get_self()
                         .await
                         .map_err(map_error!("Failed to query admin api response"))?
                         .map_err(map_error!("Command 'getself' failed"))?;
-                    let build_version = info.build_version;
-                    let version: Vec<u64> = build_version
-                        .as_str()
-                        .split(['.', '-'].as_slice())
-                        .take(3)
-                        .filter_map(|v| v.parse().ok())
-                        .collect();
-
-                    let version: [u64; 3] = match version.try_into() {
-                        Ok(version) => version,
-                        Err(_) => {
-                            error!("Failed to parse router version '{build_version}'");
-                            continue;
-                        }
-                    };
 
                     // If router version is lower then v0.4.5
-                    if version[0] == 0
-                        && version[1] <= 4
-                        && (version[1] < 4 || version[2] < 5)
+                    if matches!(version, RouterVersion::__v0_4_4)
                         && config.yggdrasil_listen.is_empty()
                     {
-                        warn!("Direct bridges can't be connected to the router of version {build_version} at {uri}");
+                        warn!("Direct bridges can't be established with the router at {uri}");
                         warn!("Routers prior to v0.4.5 (Oct 2022) don't support addpeer/removepeer commands");
-                        warn!("Help: Specify `yggdrasil_addresses` in the config or update your router");
+                        warn!("Hint: Specify `yggdrasil_addresses` in the config file or update your router");
                     }
 
                     // If router version is lower then v0.5.0 and quic protocol is specified
@@ -73,10 +57,12 @@ pub async fn connect(config: Config) -> Result<RouterState, ()> {
                         .yggdrasil_protocols
                         .iter()
                         .any(|p| *p == PeeringProtocol::Quic)
+                        && matches!(
+                            version,
+                            RouterVersion::__v0_4_4 | RouterVersion::v0_4_5__v0_4_7
+                        )
                     {
-                        if version[0] == 0 && version[1] < 5 {
-                            warn!("Transport protocol Quic is not supported by the router of version {build_version} at {uri}");
-                        }
+                        warn!("Transport protocol Quic is not supported by the router at {uri}");
                     }
 
                     // If any client-server peering protocol doesn't have `listen` peer listed
@@ -103,7 +89,7 @@ pub async fn connect(config: Config) -> Result<RouterState, ()> {
                     return Ok(RouterState {
                         version,
                         address: info.address,
-                        admin_api: endpoint,
+                        admin_api: RwLock::new(endpoint),
                     });
                 }
             }
@@ -125,14 +111,12 @@ pub async fn monitor(
     watch_sessions: watch::Sender<Vec<yggdrasilctl::SessionEntry>>,
     watch_peers: watch::Sender<Vec<yggdrasilctl::PeerEntry>>,
 ) -> Result<(), ()> {
-    let cancellation = state.cancellation.clone();
-
     loop {
         {
             let io_err = map_error!("Failed to query admin api");
             let api_err = map_error!("Admin api returned error");
 
-            let endpoint = &mut state.router.write().await.admin_api;
+            let endpoint = &mut state.router.admin_api.write().await;
 
             watch_sessions
                 .send(
@@ -153,9 +137,6 @@ pub async fn monitor(
                 )
                 .unwrap();
         }
-        select! {
-            _ = sleep(config.yggdrasilctl_query_delay) => {},
-            _ = cancellation.cancelled() => return Ok(()),
-        }
+        sleep(config.yggdrasilctl_query_delay).await;
     }
 }

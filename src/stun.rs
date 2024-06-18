@@ -17,7 +17,7 @@ pub struct ExternalAddress {
 }
 
 /// Monitor external internet addresses
-#[instrument(parent = None, name = "External address watcher ", skip_all)]
+#[instrument(parent = None, name = "External address watcher", skip_all)]
 pub async fn monitor(
     config: Config,
     state: State,
@@ -25,9 +25,36 @@ pub async fn monitor(
     watch_external: watch::Sender<Vec<ExternalAddress>>,
     mut external_required: watch::Receiver<Instant>,
 ) -> Result<(), ()> {
-    let cancellation = state.cancellation.clone();
     let mut random = StdRng::from_entropy();
-    let mut servers = config.stun_servers.clone();
+    struct Server<'a> {
+        server: &'a str,
+        tcp_status: bool,
+        udp_status: bool,
+    }
+    impl<'a> Server<'a> {
+        fn set(&self, protocol: NetworkProtocol) -> bool {
+            match protocol {
+                NetworkProtocol::Tcp => self.tcp_status,
+                NetworkProtocol::Udp => self.udp_status,
+            }
+        }
+        fn reset(&mut self, protocol: NetworkProtocol, value: bool) {
+            match protocol {
+                NetworkProtocol::Tcp => self.tcp_status = value,
+                NetworkProtocol::Udp => self.udp_status = value,
+            }
+        }
+    }
+    let mut servers: Vec<Server> = config
+        .stun_servers
+        .iter()
+        .map(|s| Server {
+            server: s.as_str(),
+            tcp_status: true,
+            udp_status: true,
+        })
+        .collect();
+
     let protocols: Vec<NetworkProtocol> = config
         .yggdrasil_protocols
         .iter()
@@ -38,16 +65,26 @@ pub async fn monitor(
     loop {
         let mut external = Vec::<ExternalAddress>::new();
 
-        for local in &local {
-            for protocol in protocols.iter() {
+        for local in local.iter().map(Clone::clone) {
+            for protocol in protocols.iter().map(Clone::clone) {
+                // Reset protocol status for every known server if they all were rendered unaccessible
+                if servers.iter().all(|s| !s.set(protocol)) {
+                    for server in servers.iter_mut() {
+                        server.reset(protocol, true);
+                    }
+                }
+
                 if config.stun_randomize {
                     servers.shuffle(&mut random);
                 }
-                for server in &servers {
-                    let address = lookup(config.clone(), *protocol, *local, server).await;
-                    if let Ok(address) = address {
-                        external.push(address);
-                        break;
+
+                for server in servers.iter_mut().filter(|s| s.set(protocol)) {
+                    match lookup(config.clone(), protocol, local, server.server).await {
+                        Ok(address) => {
+                            external.push(address);
+                            break;
+                        }
+                        Err(()) => server.reset(protocol, false),
                     }
                 }
             }
@@ -65,20 +102,17 @@ pub async fn monitor(
 
         if required {
             // Delay next request
-            select! {
-                _ = sleep(config.resolve_external_address_delay) => {},
-                _ = cancellation.cancelled() => return Ok(()),
-            };
+            sleep(config.resolve_external_address_delay).await;
         } else {
             debug!("No update required, suspending");
             loop {
                 // Wait until any new session is started
-                select! {
-                    (err, ()) = async {
-                        join!(external_required.changed(), sleep(config.resolve_external_address_delay))
-                    } => err.map_err(|_| ())?,
-                    _ = cancellation.cancelled() => return Ok(()),
-                };
+                let (err, _) = join!(
+                    external_required.changed(),
+                    sleep(config.resolve_external_address_delay)
+                );
+                err.map_err(|_| ())?;
+
                 // Check if any bridge is running
                 if !state
                     .active_sessions
@@ -100,10 +134,10 @@ pub async fn lookup(
     config: Config,
     protocol: NetworkProtocol,
     local: SocketAddr,
-    server: &String,
+    server: &str,
 ) -> Result<ExternalAddress, ()> {
     // Resolve server address
-    let server_address = lookup_host(server.as_str())
+    let server_address = lookup_host(server)
         .await
         .map_err(map_info!("Failed to lookup server address"))
         .map(|addrs| {
@@ -153,7 +187,7 @@ pub async fn lookup(
     Ok(ExternalAddress {
         local,
         external: external_address,
-        protocol: protocol,
+        protocol,
     })
 }
 

@@ -21,7 +21,7 @@ pub fn create_tcp_socket_in_domain(domain: &SocketAddr, port: u16) -> Result<Tcp
 
 #[instrument(name = "New socket ", skip_all, fields(address = %address))]
 pub fn create_tcp_socket(address: SocketAddr) -> Result<TcpSocket, ()> {
-    let map_err = map_error!("Failed to crate socket");
+    let map_err = map_error!("Failed to create socket");
 
     let socket = Socket::new(
         match address {
@@ -33,9 +33,6 @@ pub fn create_tcp_socket(address: SocketAddr) -> Result<TcpSocket, ()> {
     )
     .map_err(map_err)?;
 
-    let timeout = Duration::from_secs(20);
-    socket.set_read_timeout(Some(timeout)).map_err(map_err)?;
-    socket.set_write_timeout(Some(timeout)).map_err(map_err)?;
     socket.set_nonblocking(true).map_err(map_err)?;
     socket.set_reuse_address(true).map_err(map_err)?;
     #[cfg(unix)]
@@ -76,9 +73,6 @@ pub fn create_udp_socket(address: SocketAddr) -> Result<UdpSocket, ()> {
     )
     .map_err(map_err)?;
 
-    let timeout = Duration::from_secs(20);
-    socket.set_read_timeout(Some(timeout)).map_err(map_err)?;
-    socket.set_write_timeout(Some(timeout)).map_err(map_err)?;
     socket.set_nonblocking(true).map_err(map_err)?;
     socket.set_reuse_address(true).map_err(map_err)?;
     #[cfg(unix)]
@@ -88,5 +82,5 @@ pub fn create_udp_socket(address: SocketAddr) -> Result<UdpSocket, ()> {
         .bind(&From::<SocketAddr>::from(address))
         .map_err(map_err)?;
 
-    Ok(UdpSocket::from_std(socket.into()).map_err(map_err)?)
+    UdpSocket::from_std(socket.into()).map_err(map_err)
 }

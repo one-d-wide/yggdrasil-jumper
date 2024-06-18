@@ -60,16 +60,50 @@ pub enum PeeringProtocol {
 }
 
 impl PeeringProtocol {
-    pub fn is_supported_by_router(&self, version: [u64; 3]) -> bool {
+    pub fn is_supported_by_router(&self, version: RouterVersion) -> bool {
         match self {
             Self::Tcp | Self::Tls => true,
-            Self::Quic if version[0] > 0 || version[1] >= 5 => true,
-            _ => false,
+            Self::Quic => !matches!(
+                version,
+                RouterVersion::__v0_4_4 | RouterVersion::v0_4_5__v0_4_7
+            ),
         }
     }
 
     pub fn id(&self) -> &'static str {
         self.into()
+    }
+}
+
+pub struct Nonce {
+    nonce: String,
+}
+impl Nonce {
+    pub fn new() -> Self {
+        let nonce: u64 = rand::random();
+        format!("{nonce:016x}").try_into().unwrap()
+    }
+    pub fn concat(&self, other: &Nonce) -> String {
+        if self.nonce > other.nonce {
+            self.nonce.clone() + &other.nonce
+        } else {
+            other.nonce.clone() + &self.nonce
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        self.nonce.as_str()
+    }
+}
+impl TryFrom<String> for Nonce {
+    type Error = ();
+    fn try_from(nonce: String) -> Result<Self, Self::Error> {
+        (nonce.len() == 16
+            && nonce.as_bytes().iter().all(|b| {
+                let b = *b;
+                (b >= b'0' && b <= b'9') | (b >= b'a' && b <= b'z') | (b >= b'A' && b <= b'Z')
+            }))
+        .then_some(Self { nonce })
+        .ok_or(())
     }
 }
 
@@ -87,7 +121,6 @@ async fn bridge(
 ) -> Result<(), ()> {
     info!("Connected");
 
-    let cancellation = state.cancellation.clone();
     let mut relays = JoinSet::new();
 
     match (peer, ygg) {
@@ -180,16 +213,14 @@ async fn bridge(
     }
 
     // Remove record when bridge is closed
-    let _state = state.clone();
-    let _bridge_record = defer_async(async move {
-        _state
-            .active_sessions
-            .write()
-            .await
-            .remove(&monitor_address);
+    let _bridge_record_guard = defer_async({
+        let state = state.clone();
+        async move {
+            state.active_sessions.write().await.remove(&monitor_address);
+        }
     });
 
-    // Await bridge unused
+    // Wait until bridge is unused
     loop {
         select! {
             // Return if relays are closed
@@ -238,7 +269,7 @@ async fn bridge(
             },
 
             // Return if cancelled
-            _ = cancellation.cancelled() => return Ok(()),
+            _ = state.cancellation.cancelled() => return Ok(()),
         }
     }
 }
@@ -252,6 +283,7 @@ pub async fn start_bridge(
     peer_addr: SocketAddr,
     monitor_address: Ipv6Addr,
     socket: RouterStream,
+    server_password: Option<String>,
 ) -> Result<(), ()> {
     debug!("Started");
 
@@ -278,8 +310,8 @@ pub async fn start_bridge(
         .filter(|_| connection_mode.as_client())
     {
         let mut iter = url.as_str().split("://");
-        let prot = iter.next().map(|i| PeeringProtocol::from_str(i));
-        let addr = iter.next().map(|a| a.split("?").next());
+        let prot = iter.next().map(PeeringProtocol::from_str);
+        let addr = iter.next().map(|a| a.split('?').next());
 
         let ygg = match (prot, addr) {
             (Some(Ok(p)), Some(Some(addr))) if p == protocol => {
@@ -303,7 +335,7 @@ pub async fn start_bridge(
                         let addr = ygg
                             .as_ref()
                             .and_then(|ygg| map_addr_err(ygg.local_addr()).ok());
-                        ygg.map(|ygg| ygg.into()).zip(addr.map(|addr| uri(addr)))
+                        ygg.map(|ygg| ygg.into()).zip(addr.map(uri))
                     }
                     PeeringProtocol::Quic => {
                         let addrs = tokio::net::lookup_host(addr)
@@ -322,7 +354,7 @@ pub async fn start_bridge(
 
                             let addr = map_addr_err(ygg.local_addr()).ok();
 
-                            Some(ygg.into()).zip(addr.map(|addr| uri(addr)))
+                            Some(ygg.into()).zip(addr.map(uri))
                         } else {
                             None
                         }
@@ -346,35 +378,51 @@ pub async fn start_bridge(
         return Err(());
     }
 
-    // Register on the router peer as a server
-    let _state = state.clone();
-    let _remove_peer = &mut None;
-    let add_peer = |uri: String| async move {
-        // Add peer now
-        _state
-            .router
-            .write()
-            .await
-            .admin_api
-            .add_peer(uri.clone(), None)
-            .await
-            .map_err(map_warn!("Failed to query admin api"))?
-            .map_err(map_warn!("Failed to add local socket as peer"))?;
-
-        // Remove peer later
-        *_remove_peer = Some(defer_async(async move {
-            _state
+    // Register peering socket as a server
+    let remove_peer = {
+        let state = state.clone();
+        |uri: String| {
+            // Create active cancellation token
+            let cancellation = state.cancellation.get_active();
+            async move {
+                // Attach active cancellation token to the current scope
+                let _cancellation = cancellation;
+                state
+                    .router
+                    .admin_api
+                    .write()
+                    .await
+                    .remove_peer(uri, None)
+                    .await
+                    .map_err(map_debug!("Failed to query admin api"))?
+                    .map_err(map_debug!("Failed to remove local socket from peer list"))
+            }
+        }
+    };
+    let remove_peer_guard = &mut None;
+    let add_peer = {
+        let state = state.clone();
+        |uri: String| async move {
+            // Add peer now
+            state
                 .router
+                .admin_api
                 .write()
                 .await
-                .admin_api
-                .remove_peer(uri, None)
+                .add_peer(
+                    server_password
+                        .map(|p| format!("{uri}?password={p}"))
+                        .unwrap_or_else(|| uri.clone()),
+                    None,
+                )
                 .await
-                .map_err(map_debug!("Failed to query admin api"))?
-                .map_err(map_debug!("Failed to remove local socket from peer list"))
-        }));
+                .map_err(map_warn!("Failed to query admin api"))?
+                .map_err(map_warn!("Failed to add local socket as peer"))?;
 
-        Ok(())
+            // Remove peer later
+            *remove_peer_guard = Some(defer_async(remove_peer(uri)));
+            Ok(())
+        }
     };
 
     let (ygg, uri) = match protocol {

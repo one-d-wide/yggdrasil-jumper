@@ -6,8 +6,8 @@ yggdrasil_admin_listen = [
 ]
 
 # List of yggdrasil listen addresses
-# Listed in the yggdrasil config as `Listen`
-# Needed for protocols: "tls", "quic"
+# Known in the yggdrasil config as `Listen`
+# Needed on at least one side for "quic" and "tls" protocols to work
 yggdrasil_listen = [ ]
 
 # Default connect/listen port on yggdrasil network
@@ -18,8 +18,8 @@ allow_ipv4 = true
 allow_ipv6 = false
 
 # List of peering protocols
-# Supported are: "tcp", "tls", "quic"
-yggdrasil_protocols = [ "tcp" ]
+# Supported are "tcp", "quic", "tls"
+yggdrasil_protocols = [ "tcp", "quic" ]
 
 # List of allowed yggdrasil addresses
 # Uncomment to apply
@@ -32,7 +32,6 @@ stun_servers = [
   "34.192.137.246:3478",
   "94.130.130.49:3478",
   "192.172.233.145:3478",
-  "185.125.180.70:3478",
   "95.216.78.222:3478",
   "88.99.67.241:3478",
   "88.218.220.40:3478",
@@ -41,7 +40,6 @@ stun_servers = [
   "83.64.250.246:3478",
   "62.72.83.10:3478",
   "202.1.117.2:3478",
-  "188.118.52.172:3478",
   "51.83.201.84:3478",
   "34.206.168.53:3478",
   "91.213.98.54:3478",

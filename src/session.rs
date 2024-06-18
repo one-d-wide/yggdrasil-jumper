@@ -46,10 +46,7 @@ async fn connect_session(
 
     debug!("Delay: {delay:.2}s");
 
-    select! {
-        _ = sleep(Duration::from_secs_f64(delay)) => {},
-        _ = state.cancellation.cancelled() => { return Ok(()); },
-    }
+    sleep(Duration::from_secs_f64(delay)).await;
 
     if let Ok(socket) = network::traverse(
         config.clone(),
@@ -62,7 +59,8 @@ async fn connect_session(
         None,
     )
     .await
-    .map_err(map_debug!("NAT traversal failed"))
+    .map_err(map_debug!("NAT traversal failed"))?
+    .map_err(map_debug!("NAT traversal unsuccessful"))
     {
         let socket = match socket {
             RouterStream::Tcp(socket) => socket,
@@ -107,7 +105,6 @@ pub async fn spawn_new_sessions(
         }
     });
 
-    let cancellation = state.cancellation.clone();
     let watch_peers = state.watch_peers.clone();
     let mut watch_sessions = state.watch_sessions.clone();
     let mut watch_external = state.watch_external.clone();
@@ -121,10 +118,7 @@ pub async fn spawn_new_sessions(
         // Suspend if no external address found
         if watch_external.borrow_and_update().is_empty() {
             warn!("No external address found, suspending");
-            select! {
-                err = watch_external.changed() => { err.map_err(|_| ())? },
-                _ = cancellation.cancelled() => return Ok(()),
-            };
+            watch_external.changed().await.map_err(|_| ())?;
             continue;
         }
 
@@ -185,9 +179,6 @@ pub async fn spawn_new_sessions(
             }
         }
 
-        select! {
-            err = watch_sessions.changed() => err.map_err(|_| ())?,
-            _ = cancellation.cancelled() => return Ok(()),
-        }
+        watch_sessions.changed().await.map_err(|_| ())?;
     }
 }
