@@ -2,7 +2,7 @@ use super::*;
 
 use {
     bytecodec::{Decode, EncodeExt},
-    rand::{rngs::StdRng, seq::SliceRandom, SeedableRng},
+    rand::seq::SliceRandom,
     stun_codec::{
         rfc5389::{attributes, methods::BINDING, Attribute},
         Message, MessageClass, MessageDecoder, MessageEncoder, TransactionId,
@@ -25,7 +25,6 @@ pub async fn monitor(
     watch_external: watch::Sender<Vec<ExternalAddress>>,
     mut external_required: watch::Receiver<Instant>,
 ) -> Result<(), ()> {
-    let mut random = StdRng::from_entropy();
     struct Server<'a> {
         server: &'a str,
         tcp_status: bool,
@@ -75,7 +74,7 @@ pub async fn monitor(
                 }
 
                 if config.stun_randomize {
-                    servers.shuffle(&mut random);
+                    servers.shuffle(&mut rand::rng());
                 }
 
                 for server in servers.iter_mut().filter(|s| s.set(protocol)) {
