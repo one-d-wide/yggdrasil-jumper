@@ -1,71 +1,53 @@
-pub use {
-    bytes::{Bytes, BytesMut},
-    futures::{stream::FuturesUnordered, FutureExt, SinkExt, StreamExt},
-    itertools::Itertools,
-    serde::{Deserialize, Serialize},
-    socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type},
-    std::{
-        cell::Cell,
-        collections::{HashMap, HashSet},
-        convert::Infallible,
-        fmt::Display,
-        future::Future,
-        io::IsTerminal,
-        io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult},
-        mem::drop,
-        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
-        ops::{Deref, DerefMut},
-        path::{Path, PathBuf},
-        rc::Rc,
-        str::FromStr,
-        sync::{Arc, Weak},
-        time::{Duration, Instant},
-    },
-    strum::IntoEnumIterator,
-    strum_macros::{EnumIter, EnumString, IntoStaticStr},
-    tokio::{
-        io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-        join,
-        net::{lookup_host, TcpListener, TcpSocket, TcpStream, UdpSocket},
-        select, spawn,
-        sync::{oneshot, watch, Notify, RwLock},
-        task::{AbortHandle, JoinSet},
-        time::{sleep, timeout},
-    },
-    tokio_util::{
-        codec::{Framed, LengthDelimitedCodec},
-        sync::CancellationToken,
-    },
-    tracing::{
-        debug, error, error_span, event, info, info_span, instrument, level_filters::LevelFilter,
-        trace, warn, Instrument, Level,
-    },
-    yggdrasilctl::{Endpoint, PeerEntry, RouterVersion, SessionEntry},
+#![allow(clippy::result_unit_err)]
+
+use std::{
+    collections::{HashMap, HashSet},
+    io::{Error as IoError, Result as IoResult},
+    net::Ipv6Addr,
+    sync::Arc,
 };
+use tokio::sync::{watch, RwLock};
+use yggdrasilctl::{PeerEntry, SessionEntry};
 
 pub mod admin_api;
 pub mod bridge;
 pub mod config;
 pub mod network;
 pub mod protocol;
+pub mod proxy_tcp;
+pub mod proxy_udp;
 pub mod session;
 pub mod stun;
 pub mod utils;
+pub mod yggdrasil_dpi;
 
 pub use admin_api::RouterState;
-pub use bridge::{ConnectionMode, NetworkProtocol, PeeringProtocol, RouterStream};
+pub use bridge::{ConnectionMode, PeeringProtocol, RouterStream};
 pub use config::Config;
-pub use session::SessionType;
-pub use stun::ExternalAddress;
-pub use utils::{defer, defer_arg, defer_async, DeferArgGuard, PassiveCancellationToken};
+pub use network::InetTraversalSession;
+pub use session::{SessionCache, SessionStage};
+pub use stun::Mapping;
 
+/// Error is already logged where it received
+pub type SilentResult<T> = Result<T, ()>;
+
+pub type State = Arc<StateInner>;
 pub struct StateInner {
-    pub router: RouterState,
-    pub watch_external: watch::Receiver<Vec<ExternalAddress>>,
+    pub router: RwLock<RouterState>,
     pub watch_sessions: watch::Receiver<Vec<SessionEntry>>,
     pub watch_peers: watch::Receiver<Vec<PeerEntry>>,
-    pub active_sessions: RwLock<HashMap<Ipv6Addr, SessionType>>,
-    pub active_sockets_tcp: RwLock<HashMap<SocketAddr, (TcpStream, DeferArgGuard<AbortHandle>)>>,
-    pub cancellation: PassiveCancellationToken,
+    /// Remote ip -> session cache
+    pub node_info_cache: RwLock<HashMap<Ipv6Addr, SessionCache>>,
+
+    /// Resolved external addresses
+    pub watch_external: watch::Receiver<Vec<Mapping>>,
+
+    /// Remote yggdrasil address -> session stage
+    pub active_sessions: RwLock<HashMap<Ipv6Addr, SessionStage>>,
+    /// Remote id -> traversal session
+    pub active_inet_traversal: RwLock<HashMap<u64, InetTraversalSession>>,
+
+    pub active_proxies: RwLock<HashSet<std::thread::ThreadId>>,
+
+    pub cancellation: utils::PassiveCancellationToken,
 }
-pub type State = Arc<StateInner>;

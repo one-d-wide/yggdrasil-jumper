@@ -1,4 +1,7 @@
-use super::*;
+use std::{
+    future::Future,
+    ops::{Deref, DerefMut},
+};
 
 /// Execute provided closure when [`DeferGuard`] goes out of scope.
 #[must_use]
@@ -90,6 +93,6 @@ where
     Fut::Output: Send + 'static,
 {
     defer(|| {
-        spawn(fut);
+        tokio::spawn(fut);
     })
 }

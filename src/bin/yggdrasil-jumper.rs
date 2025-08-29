@@ -1,33 +1,49 @@
-use yggdrasil_jumper::*;
+use std::{io::IsTerminal, path::PathBuf, sync::Arc, time::Instant};
+use tokio::{
+    select, spawn,
+    sync::{watch, RwLock},
+    task::JoinSet,
+};
+use tracing::{error, info, level_filters::LevelFilter};
+
+use yggdrasil_jumper::{
+    admin_api, config, network, session, stun, utils, SilentResult, State, StateInner,
+};
 
 #[derive(Debug, clap::Parser)]
 #[command(version)]
 pub struct CliArgs {
     #[arg(long, help = "Read config from specified file")]
     pub config: Option<PathBuf>,
-    #[arg(long, help = "Print default config and exit")]
-    pub print_default: bool,
+    #[arg(long, help = "Show default config and exit")]
+    #[arg(aliases = [ "show-default", "print-defaults", "print-default" ])]
+    pub show_defaults: bool,
     #[arg(long, help = "Validate config and exit")]
     pub validate: bool,
+    #[arg(long, help = "Reconnect to admin api if router stops")]
+    pub reconnect: bool,
     #[arg(long, help = "Set log verbosity level", default_value = "INFO")]
     pub loglevel: LevelFilter,
-    #[arg(long = "no-color", help = "Whether to disable auto coloring", action = clap::ArgAction::SetFalse)]
+    #[arg(long = "no-color", help = "Disable auto coloring", action = clap::ArgAction::SetFalse)]
     pub use_color: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let (mut cancellation_root, cancellation) = utils::cancellation();
-    let err = start(cancellation).await;
+    let res = start(cancellation).await;
+
     cancellation_root.cancel().await;
-    err.map_err(|_| std::process::exit(1)).ok();
+    if let Err(()) = res {
+        std::process::exit(1);
+    }
 }
 
-pub async fn start(cancellation: PassiveCancellationToken) -> Result<(), ()> {
+pub async fn start(cancellation: utils::PassiveCancellationToken) -> SilentResult<()> {
     // Read CLI arguments
     let cli_args: CliArgs = clap::Parser::try_parse().unwrap_or_else(|err| err.exit());
 
-    if cli_args.print_default {
+    if cli_args.show_defaults {
         print!("{}", config::ConfigInner::default_str());
         return Ok(());
     }
@@ -48,10 +64,11 @@ pub async fn start(cancellation: PassiveCancellationToken) -> Result<(), ()> {
         .init();
 
     // Read config file
-    let config = Arc::new(match cli_args.config {
-        Some(ref path) => config::ConfigInner::read(path)?,
+    let config = match &cli_args.config {
+        Some(path) => config::ConfigInner::read(path)?,
         None => config::ConfigInner::default(),
-    });
+    };
+    let config = Arc::new(config);
 
     if cli_args.validate {
         return cli_args
@@ -60,8 +77,10 @@ pub async fn start(cancellation: PassiveCancellationToken) -> Result<(), ()> {
             .ok_or_else(|| error!("Config file is not specified"));
     }
 
+    let reconnect = cli_args.reconnect || config.yggdrasil_admin_reconnect;
+
     // Construct state
-    let router_state = admin_api::connect(config.clone())
+    let router_state = admin_api::reconnect(&config, reconnect)
         .await
         .map_err(|_| error!("Failed to connect to admin socket"))?;
     let watch_sessions = watch::channel(Vec::new());
@@ -69,82 +88,128 @@ pub async fn start(cancellation: PassiveCancellationToken) -> Result<(), ()> {
     let watch_external = watch::channel(Vec::new());
 
     let state = State::new(StateInner {
-        router: router_state,
-        watch_external: watch_external.1,
+        router: RwLock::new(router_state),
         watch_sessions: watch_sessions.1,
         watch_peers: watch_peers.1,
-        active_sessions: RwLock::new(HashMap::new()),
-        active_sockets_tcp: RwLock::new(HashMap::new()),
+        node_info_cache: Default::default(),
+        watch_external: watch_external.1,
+        active_sessions: Default::default(),
+        active_inet_traversal: Default::default(),
+        active_proxies: Default::default(),
         cancellation: cancellation.clone(),
     });
 
-    // Spawn & wait
     let external_required = watch::channel(Instant::now());
-    let (external_listeners, external_addresses) =
-        network::create_listener_sockets(config.clone(), state.clone())?;
 
-    let mut stop_signals = {
-        let mut signals = JoinSet::<()>::new();
+    let mut signals = signal_harness();
 
-        signals.spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-        });
+    let (locals, mut inet_listeners) =
+        network::setup_inet_listeners(config.clone(), state.clone())?;
 
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut listen = |kind| {
-                if let Some(mut signal) = signal(kind).ok() {
-                    signals.spawn(async move {
-                        signal.recv().await;
-                    });
-                };
-            };
+    #[cfg(debug_assertions)]
+    spawn(debug_sanity_checker(state.clone()));
 
-            listen(SignalKind::interrupt());
-            listen(SignalKind::terminate());
-            listen(SignalKind::hangup());
-        }
-
-        #[cfg(windows)]
-        {
-            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
-            macro_rules! listen {
-                ($signal:expr) => {
-                    if let Ok(mut signal) = $signal {
-                        signals.spawn(async move {
-                            signal.recv().await;
-                        });
-                    }
-                }
-            }
-
-            listen!(ctrl_break());
-            listen!(ctrl_c());
-            listen!(ctrl_close());
-            listen!(ctrl_shutdown());
-        }
-
-        signals
-    };
-
+    // Spawn & wait
     select! {
-        _ = spawn(network::setup_listeners(config.clone(), state.clone(), external_listeners)) => {},
-        _ = spawn(stun::monitor(config.clone(), state.clone(), external_addresses, watch_external.0, external_required.1)) => {},
+        _ = inet_listeners.join_next() => {},
+
+        _ = spawn(stun::monitor(
+            config.clone(),
+            state.clone(),
+            watch_external.0,
+            external_required.1,
+            locals,
+        )) => {},
+
         _ = spawn(admin_api::monitor(
             config.clone(),
             state.clone(),
             watch_sessions.0,
-            watch_peers.0
+            watch_peers.0,
+            reconnect,
         )) => {},
-        _ = spawn(session::spawn_new_sessions(config.clone(), state.clone(), external_required.0)) => {},
+
+        _ = spawn(session::spawn_new_sessions(
+            config.clone(),
+            state.clone(),
+            external_required.0,
+        )) => {},
 
         _ = cancellation.cancelled() => {},
-        _ = stop_signals.join_next() => {
+        _ = signals.join_next() => {
             info!("Stop signal received");
             return Ok(());
         },
     }
 
     Err(())
+}
+
+fn signal_harness() -> JoinSet<()> {
+    let mut signals = JoinSet::<()>::new();
+
+    signals.spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+    });
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut listen = |kind| {
+            if let Ok(mut signal) = signal(kind) {
+                signals.spawn(async move {
+                    signal.recv().await;
+                });
+            };
+        };
+
+        listen(SignalKind::interrupt());
+        listen(SignalKind::terminate());
+        listen(SignalKind::hangup());
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+        macro_rules! listen {
+            ($signal:expr) => {
+                if let Ok(mut signal) = $signal {
+                    signals.spawn(async move {
+                        signal.recv().await;
+                    });
+                }
+            };
+        }
+
+        listen!(ctrl_break());
+        listen!(ctrl_c());
+        listen!(ctrl_close());
+        listen!(ctrl_shutdown());
+    }
+
+    signals
+}
+
+#[cfg(debug_assertions)]
+async fn debug_sanity_checker(state: State) {
+    use tracing::warn;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        if !state.watch_sessions.borrow().is_empty() && !state.watch_peers.borrow().is_empty() {
+            continue;
+        }
+
+        if !state.active_sessions.read().await.is_empty() {
+            warn!("Some sessions are lingering");
+        }
+
+        if !state.active_inet_traversal.read().await.is_empty() {
+            warn!("Some traversal sessions are lingering");
+        }
+
+        if !state.active_proxies.read().await.is_empty() {
+            warn!("Some proxy threads are still running");
+        }
+    }
 }

@@ -1,18 +1,36 @@
-use super::*;
+use serde::{Deserialize, Serialize};
+
+use std::{
+    net::{Ipv6Addr, SocketAddr},
+    str::FromStr,
+};
+use strum_macros::{EnumString, IntoStaticStr};
+use tokio::{
+    net::{TcpStream, UdpSocket},
+    select, spawn,
+    time::Instant,
+};
+use tracing::{debug, info, instrument, warn};
+use yggdrasilctl::RouterVersion;
+
+use crate::{
+    map_debug, map_warn, protocol, proxy_tcp, proxy_udp, utils, Config, SessionStage, SilentResult,
+    State,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionMode {
     Any,
-    AsClient,
-    AsServer,
+    ToEndpoint,
+    AsEndpoint,
 }
 
 impl ConnectionMode {
-    pub fn as_client(self) -> bool {
-        matches!(self, Self::Any | Self::AsClient)
+    pub fn to_endpoint(self) -> bool {
+        matches!(self, Self::Any | Self::ToEndpoint)
     }
-    pub fn as_server(self) -> bool {
-        matches!(self, Self::Any | Self::AsServer)
+    pub fn as_endpoint(self) -> bool {
+        matches!(self, Self::Any | Self::AsEndpoint)
     }
 }
 
@@ -20,33 +38,6 @@ impl ConnectionMode {
 pub enum RouterStream {
     Tcp(TcpStream),
     Udp(UdpSocket),
-}
-
-impl From<TcpStream> for RouterStream {
-    fn from(value: TcpStream) -> Self {
-        Self::Tcp(value)
-    }
-}
-
-impl From<UdpSocket> for RouterStream {
-    fn from(value: UdpSocket) -> Self {
-        Self::Udp(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NetworkProtocol {
-    Tcp,
-    Udp,
-}
-
-impl From<PeeringProtocol> for NetworkProtocol {
-    fn from(value: PeeringProtocol) -> Self {
-        match value {
-            PeeringProtocol::Tcp | PeeringProtocol::Tls => Self::Tcp,
-            PeeringProtocol::Quic => Self::Udp,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -60,7 +51,7 @@ pub enum PeeringProtocol {
 }
 
 impl PeeringProtocol {
-    pub fn is_supported_by_router(&self, version: RouterVersion) -> bool {
+    pub fn is_supported_by_router(&self, version: &RouterVersion) -> bool {
         match self {
             Self::Tcp | Self::Tls => true,
             Self::Quic => !matches!(
@@ -70,130 +61,89 @@ impl PeeringProtocol {
         }
     }
 
-    pub fn id(&self) -> &'static str {
+    pub fn scheme(&self) -> &'static str {
         self.into()
     }
 }
 
-pub struct Nonce {
-    nonce: String,
-}
-impl Nonce {
-    pub fn new() -> Self {
-        let nonce: u64 = rand::random();
-        format!("{nonce:016x}").try_into().unwrap()
+pub fn peering_direction(
+    self_header: &protocol::Header,
+    remote_header: &protocol::Header,
+) -> Option<(PeeringProtocol, ConnectionMode)> {
+    // Prioritize Quic
+    if let Some(res) = protocol_supported(self_header, remote_header, PeeringProtocol::Quic) {
+        return Some(res);
     }
-    pub fn concat(&self, other: &Nonce) -> String {
-        if self.nonce > other.nonce {
-            self.nonce.clone() + &other.nonce
+
+    // Then Tcp
+    if let Some(res) = protocol_supported(self_header, remote_header, PeeringProtocol::Tcp) {
+        return Some(res);
+    }
+
+    // And finally Tls
+    protocol_supported(self_header, remote_header, PeeringProtocol::Tls)
+}
+
+pub fn protocol_supported(
+    self_header: &protocol::Header,
+    remote_header: &protocol::Header,
+    prot: PeeringProtocol,
+) -> Option<(PeeringProtocol, ConnectionMode)> {
+    if !self_header.supported_protocols.contains(&prot)
+        || !remote_header.supported_protocols.contains(&prot)
+    {
+        return None;
+    }
+
+    let self_serv = self_header.server_available.contains(&prot);
+    let remote_serv = remote_header.server_available.contains(&prot);
+
+    let mode = if self_serv && remote_serv {
+        if self_header.rand < remote_header.rand {
+            ConnectionMode::ToEndpoint
         } else {
-            other.nonce.clone() + &self.nonce
+            ConnectionMode::AsEndpoint
         }
-    }
-    pub fn as_str(&self) -> &str {
-        self.nonce.as_str()
-    }
-}
-impl TryFrom<String> for Nonce {
-    type Error = ();
-    fn try_from(nonce: String) -> Result<Self, Self::Error> {
-        (nonce.len() == 16
-            && nonce.as_bytes().iter().all(|b| {
-                let b = *b;
-                (b >= b'0' && b <= b'9') | (b >= b'a' && b <= b'z') | (b >= b'A' && b <= b'Z')
-            }))
-        .then_some(Self { nonce })
-        .ok_or(())
-    }
+    } else if self_serv {
+        ConnectionMode::ToEndpoint
+    } else if remote_serv {
+        ConnectionMode::AsEndpoint
+    } else if matches!(prot, PeeringProtocol::Tcp) {
+        ConnectionMode::Any
+    } else {
+        return None;
+    };
+
+    Some((prot, mode))
 }
 
-pub const QUIC_MAXIMUM_PACKET_SIZE: usize = 1500;
+pub struct BridgeParams {
+    pub protocol: PeeringProtocol,
+    pub connection_mode: ConnectionMode,
+    pub peer_addr: SocketAddr,
+    pub peer_conv: u32,
+    pub yggdrasil_dpi: bool,
+    pub monitor_address: Ipv6Addr,
+}
 
-#[instrument(parent = None, name = "Bridge ", skip_all, fields(peer = ?monitor_address, remote = %peer_addr, uri = %uri))]
+#[instrument(parent = None, name = "Bridge ", skip_all,
+    fields(peer = utils::pretty_ip(params.monitor_address), remote = %params.peer_addr,
+            uri = %uri, dpi = ?params.yggdrasil_dpi))]
 async fn bridge(
     config: Config,
     state: State,
-    monitor_address: Ipv6Addr,
-    peer_addr: SocketAddr,
-    peer: RouterStream,
+    peer: UdpSocket,
     ygg: RouterStream,
     uri: String,
-) -> Result<(), ()> {
+    params: BridgeParams,
+) -> SilentResult<()> {
     info!("Connected");
 
-    let mut relays = JoinSet::new();
-
-    match (peer, ygg) {
-        // Relay UDP traffic
-        (RouterStream::Tcp(peer), RouterStream::Tcp(ygg)) => {
-            let (peer_read, peer_write) = peer.into_split();
-            let (ygg_read, ygg_write) = ygg.into_split();
-
-            use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-            let tcp_relay = |reader: OwnedReadHalf, mut writer: OwnedWriteHalf| async move {
-                let mut reader = BufReader::new(reader);
-                loop {
-                    let buf = reader
-                        .fill_buf()
-                        .await
-                        .map_err(map_debug!("Failed to read"))?;
-                    let len = buf.len();
-                    if len == 0 {
-                        debug!("Connection closed");
-                        return Result::<(), ()>::Ok(());
-                    }
-                    writer
-                        .write_all(buf)
-                        .await
-                        .map_err(map_debug!("Failed to write"))?;
-                    trace!("Sent {} byte(s)", len);
-                    reader.consume(len);
-                }
-            };
-
-            relays.spawn(
-                tcp_relay(ygg_read, peer_write)
-                    .instrument(error_span!(" Router -> Peer TCP relay")),
-            );
-            relays.spawn(
-                tcp_relay(peer_read, ygg_write)
-                    .instrument(error_span!(" Peer -> Router TCP relay")),
-            );
+    let (mut term_rx, _guard) = match ygg {
+        RouterStream::Udp(ygg) => proxy_udp::setup_proxy_udp(&config, &state, ygg, peer).await?,
+        RouterStream::Tcp(ygg) => {
+            proxy_tcp::setup_proxy_tcp(&config, &state, ygg, peer, &params).await?
         }
-        // Relay UDP traffic
-        (RouterStream::Udp(peer), RouterStream::Udp(ygg)) => {
-            let peer_read = Arc::new(peer);
-            let peer_write = peer_read.clone();
-            let ygg_read = Arc::new(ygg);
-            let ygg_write = ygg_read.clone();
-
-            let udp_relay = |reader: Arc<UdpSocket>, writer: Arc<UdpSocket>| async move {
-                let mut buf = Box::new([0u8; QUIC_MAXIMUM_PACKET_SIZE]);
-                loop {
-                    let received = reader
-                        .recv(&mut buf[..])
-                        .await
-                        .map_err(map_debug!("Failed to recv"))?;
-
-                    writer
-                        .send(&buf[..received])
-                        .await
-                        .map_err(map_debug!("Failed to send"))?;
-                    trace!("Sent {} byte(s)", &buf[..received].len());
-                }
-            };
-
-            relays.spawn(
-                udp_relay(peer_read, ygg_write)
-                    .instrument(error_span!(" Peer -> Router UDP relay")),
-            );
-            relays.spawn(
-                udp_relay(ygg_read, peer_write)
-                    .instrument(error_span!(" Router -> Peer UDP relay")),
-            );
-        }
-
-        _ => unreachable!(),
     };
 
     let mut watch_peers = state.watch_peers.clone();
@@ -205,29 +155,32 @@ async fn bridge(
         .active_sessions
         .write()
         .await
-        .insert(monitor_address, SessionType::Bridge);
-    if let Some(SessionType::Bridge) = old {
+        .insert(params.monitor_address, SessionStage::Bridge);
+    if let Some(SessionStage::Bridge) = old {
         // Multiple connections with the same identifiers are not allowed by the OS.
         warn!("Bridge is already exist");
         return Err(());
     }
 
     // Remove record when bridge is closed
-    let _bridge_record_guard = defer_async({
+    let _bridge_record_guard = utils::defer_async({
         let state = state.clone();
         async move {
-            state.active_sessions.write().await.remove(&monitor_address);
+            state
+                .active_sessions
+                .write()
+                .await
+                .remove(&params.monitor_address);
         }
     });
 
     // Wait until bridge is unused
     loop {
         select! {
-            // Return if relays are closed
-            _ = relays.join_next() => {
-                relays.abort_all();
-                return Err(info!("Bridge is closed"));
-            },
+            _ = term_rx.recv() => {
+                info!("Connection broken");
+                return Err(());
+            }
 
             // Return if peer is not connected or wrong node is peered
             err = watch_peers.changed() => {
@@ -247,24 +200,27 @@ async fn bridge(
                         .filter(|peer| peer.up)
                         .any(|peer| peer.remote.as_ref() == Some(&uri))
                 {
-                    return Err(info!("Bridge is not connected as peer"));
+                    info!("Bridge is not connected as peer");
+                    return Err(());
                 }
 
-                // Return if peer is of unexpected address
+                // Return if peer is on unexpected address
                 if let Some(connected_address) = peers.iter()
                         .filter(|peer| peer.remote.as_ref() == Some(&uri))
                         .filter_map(|peer| peer.address)
-                        .find(|address| address != &monitor_address)
+                        .find(|address| address != &params.monitor_address)
                 {
-                    return Err(warn!("Bridge had been connected to the wrong node: {connected_address}"));
+                    warn!("Bridge had been connected to the wrong node: {connected_address}");
+                    return Err(());
                 }
             },
 
             // Return if session is closed
             err = watch_sessions.changed()  => {
                 err.map_err(|_| ())?;
-                if ! watch_sessions.borrow().iter().any(|session| &session.address == &monitor_address) {
-                    return Err(info!("Associated session is closed"));
+                if ! watch_sessions.borrow().iter().any(|session| session.address == params.monitor_address) {
+                    info!("Associated session is closed");
+                    return Err(());
                 }
             },
 
@@ -274,188 +230,103 @@ async fn bridge(
     }
 }
 
-#[instrument(parent = None, name = "Connect bridge ", skip_all, fields(mode = ?connection_mode, peer = ?monitor_address, remote = %peer_addr))]
-pub async fn start_bridge(
-    config: Config,
-    state: State,
+/// Generate yggdrasil peer uri for the bridge
+fn peer_uri(protocol: PeeringProtocol, local_addr: &SocketAddr) -> String {
+    format!(
+        "{}://{}:{}",
+        protocol.scheme(),
+        match local_addr {
+            SocketAddr::V4(_) => "127.0.0.1",
+            SocketAddr::V6(_) => "[::1]",
+        },
+        local_addr.port(),
+    )
+}
+
+async fn connect_to_peer(
+    config: &Config,
     protocol: PeeringProtocol,
-    connection_mode: ConnectionMode,
-    peer_addr: SocketAddr,
-    monitor_address: Ipv6Addr,
-    socket: RouterStream,
-    server_password: Option<String>,
-) -> Result<(), ()> {
-    debug!("Started");
+    addr: &str,
+) -> SilentResult<(RouterStream, String)> {
+    let addr = tokio::net::lookup_host(addr)
+        .await
+        .map_err(map_warn!("Failed lookup {addr}"))?
+        .next()
+        .ok_or_else(|| warn!("Failed to lookup suitable address for {addr}"))?;
 
-    // Generate yggdrasil peer uri for given address and protocol
-    let uri = |local_addr| {
-        format!(
-            "{}://{}:{}",
-            protocol.id(),
-            match local_addr {
-                SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            },
-            local_addr.port(),
-        )
-    };
-    let map_addr_err = |err: IoResult<SocketAddr>| {
-        err.map_err(map_warn!("Failed to retrieve local socket address"))
-    };
-
-    // Try connect self to the router listen address directly
-    for url in config
-        .yggdrasil_listen
-        .iter()
-        .filter(|_| connection_mode.as_client())
-    {
-        let mut iter = url.as_str().split("://");
-        let prot = iter.next().map(PeeringProtocol::from_str);
-        let addr = iter.next().map(|a| a.split('?').next());
-
-        let ygg = match (prot, addr) {
-            (Some(Ok(p)), Some(Some(addr))) if p == protocol => {
-                if p != protocol {
-                    continue;
-                }
-                match protocol {
-                    PeeringProtocol::Tcp | PeeringProtocol::Tls => {
-                        let ygg =
-                            timeout(config.connect_as_client_timeout, TcpStream::connect(addr))
-                                .await
-                                .map_err(map_warn!(
-                                    "Failed to connect to router listen socket at {addr}"
-                                ))
-                                .and_then(|e| {
-                                    e.map_err(map_warn!(
-                                        "Failed to connect to router listen socket at {addr}"
-                                    ))
-                                })
-                                .ok();
-                        let addr = ygg
-                            .as_ref()
-                            .and_then(|ygg| map_addr_err(ygg.local_addr()).ok());
-                        ygg.map(|ygg| ygg.into()).zip(addr.map(uri))
-                    }
-                    PeeringProtocol::Quic => {
-                        let addrs = tokio::net::lookup_host(addr)
-                            .await
-                            .map_err(map_warn!("Failed to lookup addr {addr}"))
-                            .ok();
-
-                        let addr = addrs.and_then(|mut a| a.next());
-
-                        if let Some(addr) = addr {
-                            let ygg = utils::create_udp_socket_in_domain(&addr, 0)?;
-                            ygg.connect(addr)
-                                .await
-                                .map_err(map_warn!("Failed to connect UDP socket to {addr}"))
-                                .ok();
-
-                            let addr = map_addr_err(ygg.local_addr()).ok();
-
-                            Some(ygg.into()).zip(addr.map(uri))
-                        } else {
-                            None
-                        }
-                    }
-                }
-            }
-            _ => {
-                debug!("Router address is unavailable: {}", url);
-                continue;
-            }
-        };
-
-        if let Some((ygg, uri)) = ygg {
-            return bridge(config, state, monitor_address, peer_addr, socket, ygg, uri).await;
-        }
-    }
-
-    // Fallback. Try connect router to self temporary socket
-    if !connection_mode.as_server() {
-        warn!("Failed to find suitable server socket");
-        return Err(());
-    }
-
-    // Register peering socket as a server
-    let remove_peer = {
-        let state = state.clone();
-        |uri: String| {
-            // Create active cancellation token
-            let cancellation = state.cancellation.get_active();
-            async move {
-                // Attach active cancellation token to the current scope
-                let _cancellation = cancellation;
-                state
-                    .router
-                    .admin_api
-                    .write()
-                    .await
-                    .remove_peer(uri, None)
-                    .await
-                    .map_err(map_debug!("Failed to query admin api"))?
-                    .map_err(map_debug!("Failed to remove local socket from peer list"))
-            }
-        }
-    };
-    let remove_peer_guard = &mut None;
-    let add_peer = {
-        let state = state.clone();
-        |uri: String| async move {
-            // Add peer now
-            state
-                .router
-                .admin_api
-                .write()
-                .await
-                .add_peer(
-                    server_password
-                        .map(|p| format!("{uri}?password={p}"))
-                        .unwrap_or_else(|| uri.clone()),
-                    None,
-                )
-                .await
-                .map_err(map_warn!("Failed to query admin api"))?
-                .map_err(map_warn!("Failed to add local socket as peer"))?;
-
-            // Remove peer later
-            *remove_peer_guard = Some(defer_async(remove_peer(uri)));
-            Ok(())
-        }
-    };
-
-    let (ygg, uri) = match protocol {
+    match protocol {
         PeeringProtocol::Tcp | PeeringProtocol::Tls => {
-            // Create socket
-            let ygg = utils::create_tcp_socket_in_domain(&peer_addr, 0)?
+            let ygg = utils::create_tcp_socket_in_domain(&addr, 0)?;
+
+            let ygg = utils::timeout(config.connect_as_client_timeout, ygg.connect(addr))
+                .await
+                .map_err(map_warn!(
+                    "Failed to connect to router listen socket at {addr}"
+                ))?;
+
+            let local_addr = ygg
+                .local_addr()
+                .map_err(map_warn!("Failed to get socket address"))?;
+
+            Ok((RouterStream::Tcp(ygg), peer_uri(protocol, &local_addr)))
+        }
+        PeeringProtocol::Quic => {
+            let ygg = utils::create_udp_socket_in_domain(&addr, 0)?;
+
+            ygg.connect(addr)
+                .await
+                .map_err(map_warn!("Failed to connect UDP socket to {addr}"))
+                .ok();
+
+            let local_addr = ygg
+                .local_addr()
+                .map_err(map_warn!("Failed to get socket address"))?;
+
+            Ok((RouterStream::Udp(ygg), peer_uri(protocol, &local_addr)))
+        }
+    }
+}
+
+async fn connect_as_peer(
+    config: &Config,
+    state: &State,
+    protocol: PeeringProtocol,
+) -> SilentResult<(RouterStream, String, impl Drop)> {
+    match protocol {
+        PeeringProtocol::Tcp | PeeringProtocol::Tls => {
+            let ygg = utils::create_tcp_socket_ipv4(0)?
                 .listen(1)
                 .map_err(map_warn!("Failed to create local inbound socket"))?;
 
+            let local_addr = ygg
+                .local_addr()
+                .map_err(map_warn!("Failed to get socket address"))?;
+
             // Register socket as a peer
-            let uri = uri(map_addr_err(ygg.local_addr())?);
-            add_peer(uri.clone()).await?;
+            let uri = peer_uri(protocol, &local_addr);
+            let remove_peer_guard = add_peer(state.clone(), uri.clone()).await?;
 
             // Await incoming connection
-            let (ygg, _) = timeout(config.connect_as_client_timeout, ygg.accept())
+            let (ygg, _) = utils::timeout(config.connect_as_client_timeout, ygg.accept())
                 .await
-                .map_err(map_warn!("Failed to accept yggdrasil connection"))?
                 .map_err(map_warn!("Failed to accept yggdrasil connection"))?;
 
-            (RouterStream::Tcp(ygg), uri)
+            Ok((RouterStream::Tcp(ygg), uri, remove_peer_guard))
         }
         PeeringProtocol::Quic => {
-            // Create socket
-            let ygg = utils::create_udp_socket_in_domain(&peer_addr, 0)?;
+            let ygg = utils::create_udp_socket_ipv4(0)?;
+
+            let local_addr = ygg
+                .local_addr()
+                .map_err(map_warn!("Failed to get socket address"))?;
 
             // Register socket as a peer
-            let uri = uri(map_addr_err(ygg.local_addr())?);
-            add_peer(uri.clone()).await?;
+            let uri = peer_uri(protocol, &local_addr);
+            let remove_peer_guard = add_peer(state.clone(), uri.clone()).await?;
 
             // Await incoming packets
-            let sender = timeout(config.connect_as_client_timeout, ygg.peek_sender())
+            let sender = utils::timeout(config.connect_as_client_timeout, ygg.peek_sender())
                 .await
-                .map_err(map_warn!("Failed to peek yggdrasil connection"))?
                 .map_err(map_warn!("Failed to peek yggdrasil connection"))?;
 
             // Connect socket to the sender of the first received packet
@@ -463,19 +334,103 @@ pub async fn start_bridge(
                 .await
                 .map_err(map_warn!("Failed to connect to yggdrasil socket"))?;
 
-            (ygg.into(), uri)
+            Ok((RouterStream::Udp(ygg), uri, remove_peer_guard))
         }
-    };
+    }
+}
+
+/// Register peering socket as a server
+async fn remove_peer(state: &State, uri: String) -> SilentResult<()> {
+    state
+        .router
+        .write()
+        .await
+        .admin_api
+        .remove_peer(uri, None)
+        .await
+        .map_err(map_debug!("Failed to query admin api"))?
+        .map_err(map_debug!("Failed to remove local socket from peer list"))?;
+    Ok(())
+}
+
+async fn add_peer(state: State, uri: String) -> SilentResult<impl Drop> {
+    state
+        .router
+        .write()
+        .await
+        .admin_api
+        .add_peer(uri.clone(), None)
+        // .add_peer(format!("{uri}?password={shared_secret}"), None) // Only works with both as-client peerings
+        .await
+        .map_err(map_warn!("Failed to query admin api"))?
+        .map_err(map_warn!("Failed to add local socket as peer"))?;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    spawn({
+        // Make sure we remove the peer before allowing the program to terminate
+        let cancellation = state.cancellation.get_active();
+        async move {
+            if let Some(cancellation) = &cancellation {
+                select! {
+                    _ = rx => {},
+                    _ = cancellation.cancelled() => {},
+                }
+            }
+            remove_peer(&state, uri).await.ok();
+        }
+    });
+
+    Ok(utils::defer(move || {
+        let _ = tx.send(());
+    }))
+}
+
+#[instrument(parent = None, name = "Starting bridge ", skip_all,
+    fields(mode = ?params.connection_mode, peer = utils::pretty_ip(params.monitor_address), remote = %params.peer_addr))]
+pub async fn start_bridge(
+    config: Config,
+    state: State,
+    socket: UdpSocket,
+    params: BridgeParams,
+) -> SilentResult<()> {
+    debug!("Started");
+
+    // Try connect to the router listen address directly
+    if params.connection_mode.to_endpoint() {
+        for url in config.yggdrasil_listen.iter() {
+            let Some((scheme, link)) = url.split_once("://") else {
+                warn!("Can't find protocol separator :// in {url:?}");
+                continue;
+            };
+            let Ok(scheme) = PeeringProtocol::from_str(scheme) else {
+                warn!("Unrecognized scheme {scheme:?} from {url:?}");
+                continue;
+            };
+            let addr = link.split("?").next().unwrap_or(link);
+
+            if scheme != params.protocol {
+                debug!("Router peer not suitable: {url:?}");
+                continue;
+            }
+
+            let Ok((ygg, peering_uri)) = connect_to_peer(&config, params.protocol, addr).await
+            else {
+                continue;
+            };
+
+            return bridge(config, state, socket, ygg, peering_uri, params).await;
+        }
+    }
+
+    // Fallback. Try connect router to self temporary socket
+    if !params.connection_mode.as_endpoint() {
+        warn!("Failed to find suitable server socket");
+        return Err(());
+    }
+
+    let (ygg, peering_uri, _remove_peer_guard) =
+        connect_as_peer(&config, &state, params.protocol).await?;
 
     // Run bridge
-    bridge(
-        config,
-        state.clone(),
-        monitor_address,
-        peer_addr,
-        socket,
-        ygg,
-        uri.clone(),
-    )
-    .await
+    bridge(config, state, socket, ygg, peering_uri, params).await
 }

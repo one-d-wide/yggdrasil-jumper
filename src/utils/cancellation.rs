@@ -1,4 +1,6 @@
-use super::*;
+use std::sync::{Arc, Weak};
+
+use tokio::sync::{oneshot, Notify};
 
 /// Create utility to start and await cancellation
 pub fn cancellation() -> (CancellationRoot, PassiveCancellationToken) {
@@ -45,7 +47,9 @@ pub struct CancellationGuard {
 
 impl Drop for CancellationGuard {
     fn drop(&mut self) {
-        self.channel.take().map(|c| c.send(()));
+        if let Some(chan) = self.channel.take() {
+            let _ = chan.send(());
+        }
     }
 }
 

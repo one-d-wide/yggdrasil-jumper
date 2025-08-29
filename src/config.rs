@@ -1,42 +1,54 @@
-use super::*;
+use serde::Deserialize;
+use std::{
+    collections::HashSet, net::Ipv6Addr, num::NonZero, path::Path, sync::Arc, time::Duration,
+};
+use tracing::error;
+
+use crate::{bridge::PeeringProtocol, map_error};
 
 pub type Config = Arc<ConfigInner>;
 
 #[derive(PartialEq, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConfigInner {
-    pub allow_ipv4: bool,
-    pub allow_ipv6: bool,
-    pub listen_port: u16,
     pub yggdrasil_listen: Vec<String>,
     pub yggdrasil_admin_listen: Vec<String>,
     pub yggdrasil_protocols: Vec<PeeringProtocol>,
-    pub whitelist: Option<HashSet<Ipv6Addr>>,
-    pub stun_randomize: bool,
-    pub stun_servers: Vec<String>,
+    pub allow_ipv4: bool,
+    pub allow_ipv6: bool,
+    pub listen_port: u16,
 
     // Fields below are not listed in example config
-    pub nat_traversal_tcp_retry_count: u64,
+    pub yggdrasil_firewall_traversal_udp_retry_count: u32,
     #[serde(deserialize_with = "parse_duration")]
-    pub nat_traversal_tcp_cycle: Duration,
-    #[serde(deserialize_with = "parse_duration")]
-    pub nat_traversal_tcp_timeout: Duration,
+    pub yggdrasil_firewall_traversal_udp_cycle: Duration,
 
-    pub nat_traversal_udp_retry_count: u64,
+    pub nat_traversal_udp_retry_count: u32,
     #[serde(deserialize_with = "parse_duration")]
     pub nat_traversal_udp_cycle: Duration,
+
+    pub stun_servers: Vec<String>,
+    pub stun_randomize: bool,
+
+    pub stun_udp_retry_count: u32,
     #[serde(deserialize_with = "parse_duration")]
-    pub nat_traversal_udp_timeout: Duration,
+    pub stun_udp_response_timeout: Duration,
+    pub stun_udp_exponential_timeout: bool,
 
     #[serde(deserialize_with = "parse_duration")]
     pub stun_tcp_response_timeout: Duration,
 
-    #[serde(deserialize_with = "parse_duration")]
-    pub stun_udp_response_timeout: Duration,
-    pub stun_udp_retry_count: u64,
+    pub whitelist: Option<HashSet<Ipv6Addr>>,
+    pub only_peers_advertising_jumper: bool,
+    pub failed_yggdrasil_traversal_limit: Option<NonZero<u32>>,
 
+    pub yggdrasil_dpi: bool,
+    pub yggdrasil_dpi_udp_mtu: usize,
+    pub yggdrasil_dpi_fallback_to_reliable: bool,
+
+    pub yggdrasil_admin_reconnect: bool,
     pub avoid_redundant_peering: bool,
-    pub force_nonce_peering_password: bool,
+
     #[serde(deserialize_with = "parse_duration")]
     pub peer_unconnected_check_delay: Duration,
     #[serde(deserialize_with = "parse_duration")]
@@ -46,7 +58,13 @@ pub struct ConfigInner {
     #[serde(deserialize_with = "parse_duration")]
     pub connect_as_client_timeout: Duration,
     #[serde(deserialize_with = "parse_duration")]
-    pub socket_inactivity_cleanup_delay: Duration,
+    pub peer_getnodeinfo_timeout: Duration,
+    #[serde(deserialize_with = "parse_duration")]
+    pub session_cache_invalidation_timeout: Duration,
+
+    pub align_uptime_timeout: f32,
+    pub inactivity_delay: f32,
+    pub inactivity_delay_period: f32,
 }
 
 impl Default for ConfigInner {
@@ -54,59 +72,70 @@ impl Default for ConfigInner {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Defaults {
-            allow_ipv4: bool,
-            allow_ipv6: bool,
-            listen_port: u16,
             yggdrasil_listen: Vec<String>,
             yggdrasil_admin_listen: Vec<String>,
             yggdrasil_protocols: Vec<PeeringProtocol>,
-            whitelist: Option<HashSet<Ipv6Addr>>,
-            stun_randomize: bool,
+            allow_ipv4: bool,
+            allow_ipv6: bool,
+            listen_port: u16,
             stun_servers: Vec<String>,
+            stun_randomize: bool,
         }
         let Defaults {
-            allow_ipv4,
-            allow_ipv6,
-            listen_port,
             yggdrasil_listen,
             yggdrasil_admin_listen,
             yggdrasil_protocols,
-            whitelist,
-            stun_randomize,
+            allow_ipv4,
+            allow_ipv6,
+            listen_port,
             stun_servers,
+            stun_randomize,
         } = toml::from_str(Self::default_str()).unwrap();
 
-        Self {
-            allow_ipv4,
-            allow_ipv6,
-            listen_port,
+        ConfigInner {
             yggdrasil_listen,
             yggdrasil_admin_listen,
             yggdrasil_protocols,
-            whitelist,
-            stun_randomize,
+            allow_ipv4,
+            allow_ipv6,
+            listen_port,
+
+            yggdrasil_firewall_traversal_udp_retry_count: 5,
+            yggdrasil_firewall_traversal_udp_cycle: Duration::from_secs_f64(1.0),
+
+            nat_traversal_udp_retry_count: 15,
+            nat_traversal_udp_cycle: Duration::from_secs_f64(0.5),
+
             stun_servers,
+            stun_randomize,
 
-            nat_traversal_tcp_retry_count: 5,
-            nat_traversal_tcp_cycle: Duration::from_secs_f64(5.0),
-            nat_traversal_tcp_timeout: Duration::from_secs_f64(4.0),
+            stun_udp_retry_count: 4,
+            stun_udp_response_timeout: Duration::from_secs_f64(0.5),
+            stun_udp_exponential_timeout: true,
 
-            nat_traversal_udp_retry_count: 10,
-            nat_traversal_udp_cycle: Duration::from_secs_f64(1.5),
-            nat_traversal_udp_timeout: Duration::from_secs_f64(1.0),
+            stun_tcp_response_timeout: Duration::from_secs_f64(4.0),
 
-            stun_tcp_response_timeout: Duration::from_secs_f64(5.0),
+            whitelist: None,
+            only_peers_advertising_jumper: false,
+            failed_yggdrasil_traversal_limit: None,
 
-            stun_udp_retry_count: 3,
-            stun_udp_response_timeout: Duration::from_secs_f64(4.0),
+            yggdrasil_dpi: false,
+            yggdrasil_dpi_udp_mtu: 1452, // 1500 (baseline mtu) - 20 (ipv4) or 40 (ipv6) - 8 (udp)
+            yggdrasil_dpi_fallback_to_reliable: true,
 
+            yggdrasil_admin_reconnect: false,
             avoid_redundant_peering: true,
-            force_nonce_peering_password: false,
-            peer_unconnected_check_delay: Duration::from_secs_f64(15.0),
-            resolve_external_address_delay: Duration::from_secs_f64(30.0),
-            yggdrasilctl_query_delay: Duration::from_secs_f64(10.0),
-            connect_as_client_timeout: Duration::from_secs_f64(5.0),
-            socket_inactivity_cleanup_delay: Duration::from_secs_f64(30.0),
+
+            peer_unconnected_check_delay: Duration::from_secs(15),
+            resolve_external_address_delay: Duration::from_secs(25),
+            yggdrasilctl_query_delay: Duration::from_secs(10),
+            connect_as_client_timeout: Duration::from_secs(5),
+            peer_getnodeinfo_timeout: Duration::from_secs(10),
+            session_cache_invalidation_timeout: Duration::from_secs(3 * 3600), // Chosen arbitrarily
+
+            align_uptime_timeout: 20.0, // Must be the same on both sides
+            inactivity_delay: 1.5 * 60.0,
+            inactivity_delay_period: 5.0 * 60.0,
         }
     }
 }
@@ -145,6 +174,7 @@ impl ConfigInner {
 
 fn parse_duration<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     use serde::de::Error;
+    // TODO: interpret suffix
     Duration::try_from_secs_f64(Deserialize::deserialize(deserializer)?).map_err(D::Error::custom)
 }
 
