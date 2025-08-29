@@ -30,11 +30,11 @@ jobs:
             output_postfix: '.exe'
 
           - output_target: darwin-x86_64
-            os: macOS-12
+            os: macos-14
             target: x86_64-apple-darwin
 
           - output_target: darwin-aarch64
-            os: macOS-12
+            os: macos-14
             target: aarch64-apple-darwin
 
     runs-on: ${{ matrix.os }}
