@@ -155,8 +155,9 @@ pub async fn setup_proxy_tcp(
 
                         if lossy {
                             assert_eq!(left, 0);
+                            let buf_len = buf.len();
                             left = send_lossy
-                                .send(&mut buf[..read], &peer, &mut k)
+                                .send(&mut buf[..read], buf_len, &peer, &mut k)
                                 .map_err(err_sending)?;
                         }
                     }

@@ -112,6 +112,7 @@ impl SendLossy {
     pub fn send(
         &mut self,
         send: &mut [u8],
+        buf_len: usize,
         peer: &std::net::UdpSocket,
         kcp: &mut kcp::Kcp<impl Write>,
     ) -> IoResult<usize> {
@@ -124,10 +125,7 @@ impl SendLossy {
         while !to_write.is_empty() {
             if self.skip != 0 {
                 let to_skip = self.skip.min(to_write.len());
-                self.skip = match self.skip.checked_sub(to_skip) {
-                    Some(skip) => skip,
-                    None => return self.recover(to_write, kcp),
-                };
+                self.skip -= to_skip;
 
                 let sent = kcp.send(&to_write[..to_skip])?;
                 assert_eq!(sent, to_skip);
@@ -147,6 +145,21 @@ impl SendLossy {
 
                         return Ok(len);
                     }
+                    Packet::Truncated(len) => {
+                        debug!("Truncated traffic packet");
+
+                        if to_write.len() < buf_len {
+                            let len = to_write.len();
+                            if len != send.len() {
+                                let range = (send.len() - len)..;
+                                send.copy_within(range, 0);
+                            }
+                            return Ok(len);
+                        }
+
+                        debug!("Too long {} bytes", len);
+                        self.skip += len;
+                    }
                     Packet::Traffic(len) if len <= self.udp_mtu => {
                         debug!("Sending {} bytes via shortcut", len);
                         let sent = peer.send(&to_write[..len])?;
@@ -163,10 +176,6 @@ impl SendLossy {
                         let sent = kcp.send(&to_write[..len])?;
                         assert_eq!(sent, len);
                         to_write = &to_write[len..];
-                    }
-                    Packet::Truncated(len) => {
-                        debug!("Too long {} bytes", len);
-                        self.skip += len;
                     }
                 }
             }
@@ -235,11 +244,7 @@ impl ReceiveLossy {
         while to_flush != to_write.len() {
             if self.skip != 0 {
                 let to_skip = self.skip.min(to_write.len() - to_flush);
-                self.skip = match self.skip.checked_sub(to_skip) {
-                    Some(skip) => skip,
-                    None => return self.recover(to_write, ygg),
-                };
-
+                self.skip -= to_skip;
                 to_flush += to_skip;
 
                 debug!("Skipped {} bytes, {} remaining", to_skip, self.skip);
@@ -249,7 +254,9 @@ impl ReceiveLossy {
                 match parse_yggdrasil_packet(&to_write[to_flush..]) {
                     Packet::Invalid => return self.recover(to_write, ygg),
                     Packet::TruncatedHeader => {
-                        ygg.write_all(&to_write[..to_flush])?;
+                        if to_flush != 0 {
+                            ygg.write_all(&to_write[..to_flush])?;
+                        }
 
                         let len = to_write.len() - to_flush;
                         let range = (recv.len() - len)..;
@@ -275,7 +282,6 @@ impl ReceiveLossy {
                         }
                     }
                     Packet::Truncated(len) => {
-                        debug!("Too long {} bytes", len);
                         self.skip += len;
                     }
                 }
