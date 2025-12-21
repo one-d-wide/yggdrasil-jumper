@@ -63,7 +63,15 @@ pub fn setup_inet_listeners(
             .local_addr()
             .map_err(map_error!("Can't get socket address"))?;
         locals.push(addr);
-        listeners.spawn(inet_listener(config.clone(), state.clone(), socket));
+
+        if cfg!(target_os = "windows") {
+            // Windows doesn't correctly distribute packets cross sockets on the same port.
+            // Tracking issue: https://github.com/one-d-wide/yggdrasil-jumper/issues/5
+            listeners.spawn(std::future::pending());
+        } else {
+            listeners.spawn(inet_listener(config.clone(), state.clone(), socket));
+        }
+
         Ok(())
     };
 
