@@ -16,6 +16,7 @@ use tokio::{
 use tracing::{debug, error, event, info, instrument, warn, Level};
 
 use crate::{
+    config::ConfigInner,
     map_debug, map_error, map_warn,
     utils::{self, defer_async, CsvIter, FutureAttach},
     Config, SilentResult, State,
@@ -23,16 +24,37 @@ use crate::{
 
 const WIREGUARD_KEEPALIVE_LEN: usize = 32;
 
-pub async fn verify() -> SilentResult<()> {
+pub fn wg_cmd(wg_type: &str) -> Option<&'static str> {
+    match wg_type {
+        "wireguard" => Some("wg"),
+        "amneziawg" => Some("awg"),
+        _ => None,
+    }
+}
+
+pub async fn verify(config: &ConfigInner) -> SilentResult<()> {
     let mut res = Ok(());
 
-    let spec = [
+    let mut spec = vec![
         ("ip link", "iproute2"),
         ("iptables --help", "iptables"),
         ("ip6tables --help", "iptables"),
-        ("wg help", "wireguard-tools"),
         ("conntrack help", "conntrack-tools"),
     ];
+
+    for wg_type in Iterator::chain(
+        config.wireguard_types.iter(),
+        config.wireguard_device_params.keys(),
+    ) {
+        match wg_type.as_str() {
+            "wireguard" => spec.push(("wg help", "wireguard-tools")),
+            "amneziawg" => spec.push(("awg help", "amneziawg-tools")),
+            _ => {
+                error!("Wireguard type {wg_type:?} is not supported");
+                return Err(());
+            }
+        }
+    }
 
     for (cmd, pkg) in spec {
         if run(cmd).await.is_err() {
@@ -52,15 +74,30 @@ async fn run(line: impl AsRef<str>) -> SilentResult<Vec<u8>> {
 }
 
 async fn run_stdin(line: impl AsRef<str>, stdin: impl AsRef<[u8]>) -> SilentResult<Vec<u8>> {
-    let line = line.as_ref();
+    run_stdin_args(line.as_ref().split(" "), stdin).await
+}
+
+async fn run_stdin_args<S: AsRef<str>>(
+    args: impl IntoIterator<Item = S>,
+    stdin: impl AsRef<[u8]>,
+) -> SilentResult<Vec<u8>> {
     let stdin = stdin.as_ref();
+
+    let mut args = args.into_iter();
+    let command = args.next().unwrap();
+    let command = command.as_ref();
+
+    let mut line = command.to_string();
+    let mut cmd = tokio::process::Command::new(command);
+    for arg in args {
+        cmd.arg(arg.as_ref());
+        line.push_str(" ");
+        line.push_str(arg.as_ref());
+    }
 
     debug!("Running {line:?}");
 
-    let (command, args) = line.split_once(" ").unwrap();
-
-    let mut proc = tokio::process::Command::new(command)
-        .args(args.split(" "))
+    let mut proc = cmd
         .stdin(if !stdin.is_empty() {
             Stdio::piped()
         } else {
@@ -118,8 +155,8 @@ struct WgLink {
     transfer_tx: u64,
 }
 
-async fn wg_dump(dev: &str) -> SilentResult<WgDev> {
-    let lines = run(format!("wg show {dev} dump")).await?;
+async fn wg_dump(wg_cmd: &str, dev: &str) -> SilentResult<WgDev> {
+    let lines = run(format!("{wg_cmd} show {dev} dump")).await?;
     let Some(Ok(line)) = lines.lines().next() else {
         warn!("Can't get wireguard device");
         return Err(());
@@ -134,8 +171,8 @@ async fn wg_dump(dev: &str) -> SilentResult<WgDev> {
     Ok(WgDev { listen_port })
 }
 
-async fn wg_dump_peer(dev: &str, pub_key: &str) -> SilentResult<WgLink> {
-    let lines = run(format!("wg show {dev} dump")).await?;
+async fn wg_dump_peer(wg_cmd: &str, dev: &str, pub_key: &str) -> SilentResult<WgLink> {
+    let lines = run(format!("{wg_cmd} show {dev} dump")).await?;
     let Some(line) = lines
         .lines()
         .skip(1)
@@ -164,13 +201,14 @@ async fn wg_dump_peer(dev: &str, pub_key: &str) -> SilentResult<WgLink> {
     })
 }
 
-pub async fn wg_genkeys() -> SilentResult<(String, String)> {
+pub async fn wg_genkeys(config: &Config) -> SilentResult<(String, String)> {
+    let wg_cmd = wg_cmd(config.wireguard_types.first().unwrap()).unwrap();
     let trim = |key: Vec<u8>| {
         String::from_utf8(key.trim_ascii().into()).map_err(map_error!("Invalid key encoding"))
     };
-    let priv_key = trim(run("wg genkey").await?)?;
+    let priv_key = trim(run(format!("{wg_cmd} genkey")).await?)?;
 
-    let pub_key = trim(run_stdin("wg pubkey", &priv_key).await?)?;
+    let pub_key = trim(run_stdin(format!("{wg_cmd} pubkey"), &priv_key).await?)?;
 
     Ok((pub_key, priv_key))
 }
@@ -324,6 +362,8 @@ pub struct WgBridgeParams {
     pub monitor_address: Ipv6Addr,
     pub inet_socket: UdpSocket,
     pub yggdrasil_socket: UdpSocket,
+    pub shared_secret: u64,
+    pub wg_type: String,
 }
 
 #[instrument(parent = None, name = "Wireguard bridge ", skip_all,
@@ -359,6 +399,9 @@ pub async fn start_bridge(
 
     let remote = &params.peer_addr;
 
+    let wg_type = &params.wg_type;
+    let wg_cmd = wg_cmd(wg_type).unwrap();
+
     // Remove previous association of traversal socket
     flush_firewall(*remote).await;
     let _guard = defer_async(flush_firewall(*remote));
@@ -369,20 +412,50 @@ pub async fn start_bridge(
 
     // TODO: Multiplex on a single wireguard device
     // TODO: add a queue?
-    run(format!("ip link add dev {dev} type wireguard")).await?;
+    run(format!("ip link add dev {dev} type {wg_type}")).await?;
     // Associated routing entries are removed automatically
     let _guard =
         defer_async(run(format!("ip link del dev {dev}")).attach(cancellation.get_active()));
 
     run(format!("ip link set dev {dev} up")).await?;
 
-    let wg_port = wg_dump(dev).await?.listen_port;
+    let wg_port = wg_dump(wg_cmd, dev).await?.listen_port;
 
-    run_stdin(
-        format!("wg set {dev} listen-port {wg_port} private-key /dev/stdin"),
-        &self_priv,
-    )
-    .await?;
+    let mut wg_dev_args: Vec<_> =
+        format!("{wg_cmd} set {dev} listen-port {wg_port} private-key /dev/stdin")
+            .split(" ")
+            .map(|s| s.to_string())
+            .collect();
+
+    if wg_type == "amneziawg" {
+        use rand::{Rng, SeedableRng};
+        let mut seed = params.shared_secret;
+        let mut rand_param = |name: &str, range| {
+            seed = seed.wrapping_add(1);
+            let value = rand_chacha::ChaCha12Rng::seed_from_u64(seed).random_range(range);
+            wg_dev_args.push(name.into());
+            wg_dev_args.push(format!("{value}"));
+        };
+
+        rand_param("jc", 4..=12);
+        rand_param("jmin", 8..=8);
+        rand_param("jmax", 80..=80);
+        for s in ["s1", "s2"] {
+            rand_param(s, 15..=150);
+        }
+        for h in ["h1", "h2", "h3", "h4"] {
+            rand_param(h, 5..=2147483647);
+        }
+    }
+
+    if let Some(params) = config.wireguard_device_params.get(wg_type) {
+        for (k, v) in params {
+            wg_dev_args.push(k.clone());
+            wg_dev_args.push(v.clone());
+        }
+    }
+
+    run_stdin_args(wg_dev_args, &self_priv).await?;
 
     setup_firewall("-I", wg_port, &params).await;
     let _guard =
@@ -394,7 +467,7 @@ pub async fn start_bridge(
         .map_err(map_warn!("Can't bind socket to device"));
 
     run(format!(
-        "wg set {dev} peer {remote_pub} persistent-keepalive 20 endpoint {remote} allowed-ips {remote_ygg_addr}/128"
+        "{wg_cmd} set {dev} peer {remote_pub} persistent-keepalive 20 endpoint {remote} allowed-ips {remote_ygg_addr}/128"
     ))
     .await?;
 
@@ -488,7 +561,7 @@ pub async fn start_bridge(
             },
         }
 
-        let dump = wg_dump_peer(dev, &params.peer_pub).await?;
+        let dump = wg_dump_peer(wg_cmd, dev, &params.peer_pub).await?;
 
         if !started {
             if dump.latest_handshake != 0 {

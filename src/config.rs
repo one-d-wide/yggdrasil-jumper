@@ -1,6 +1,11 @@
 use serde::Deserialize;
 use std::{
-    collections::HashSet, net::Ipv6Addr, num::NonZero, path::Path, sync::Arc, time::Duration,
+    collections::{HashMap, HashSet},
+    net::Ipv6Addr,
+    num::NonZero,
+    path::Path,
+    sync::Arc,
+    time::Duration,
 };
 use tracing::error;
 
@@ -43,6 +48,8 @@ pub struct ConfigInner {
     pub failed_yggdrasil_traversal_limit: Option<NonZero<u32>>,
 
     pub wireguard: bool,
+    pub wireguard_types: Vec<String>,
+    pub wireguard_device_params: HashMap<String, HashMap<String, String>>,
     pub wireguard_skip_checks: bool,
     #[serde(deserialize_with = "parse_duration")]
     pub wireguard_query_delay: Duration,
@@ -141,6 +148,8 @@ impl Default for ConfigInner {
             failed_yggdrasil_traversal_limit: None,
 
             wireguard: false,
+            wireguard_types: vec!["wireguard".to_string()],
+            wireguard_device_params: Default::default(),
             wireguard_skip_checks: false,
             wireguard_query_delay: Duration::from_secs(2),
             // Time to initially wait, until connection is established
@@ -155,7 +164,7 @@ impl Default for ConfigInner {
             wireguard_handshake_renew_timeout: 180,
             wireguard_shutdown_notification_count: 5,
             wireguard_shutdown_notification_delay: Duration::from_secs_f64(0.3),
-            wireguard_device_prefix: "wg-jumper".into(),
+            wireguard_device_prefix: "wg-jumper-".into(),
             wireguard_device_rounds: 1000,
             // Keep yggdrasil session alive, while wireguard bridge is active
             wireguard_yggdrasil_keepalive: false,
@@ -216,7 +225,7 @@ impl ConfigInner {
 
         if self.wireguard && !self.wireguard_skip_checks {
             #[cfg(target_os = "linux")]
-            crate::bridge_wireguard::verify().await?;
+            crate::bridge_wireguard::verify(&self).await?;
             #[cfg(not(target_os = "linux"))]
             {
                 error!("Wireguard not supported on this platform");

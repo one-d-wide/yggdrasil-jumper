@@ -1066,6 +1066,7 @@ dependencies = [
  "clap",
  "kcp",
  "rand",
+ "rand_chacha",
  "serde",
  "serde_json",
  "socket2",

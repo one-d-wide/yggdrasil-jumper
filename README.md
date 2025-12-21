@@ -117,10 +117,17 @@ traversal succeeds.
 - `wireguard = true` (default is false) - send all traffic between peers using
 wireguard, eliminating added latency even under load. Only supported on linux,
 and requires CAP_NET_ADMIN capability or root privileges. See [Bridging over
-WireGuard](#Bridging-over-WireGuard).
+WireGuard](#Bridging-over-WireGuard) and [Bridging over
+AmneziaWG](#Bridging-over-AmneziaWG).
 
 - `wireguard_yggdrasil_keepalive` (default is false) - whether to keep
 yggdrasil session alive, while wireguard bridge is active.
+
+- `wireguard_types = ["wireguard", "amneziawg"]` (default is "wireguard") - set
+allowed wireguard implementations.
+
+- `wireguard_device_params.<type>.<param> = ...` - override wireguard device
+configuration, including amneziawg obfuscation options.
 
 - `yggdrasil_dpi` (highly experimental, prefer wireguard if available) - send
 network traffic over an unreliable channel, reducing latency under network
@@ -166,6 +173,25 @@ encrypted.
 > jumper should interface directly with kernel using netlink instead.
 
 [repology]: https://repology.org/projects/
+
+## Bridging over AmneziaWG
+
+[AmneziaWG][amneziawg] is a fork of Wireguard adding support for traffic
+obfuscation. You need to install a separate kernel module and amneziawg-tools
+package.
+
+[amneziawg]: https://docs.amnezia.org/documentation/amnezia-wg/
+
+Set `wireguard_types = [ "wireguard", "amneziawg" ]` on both sides (amneziawg
+is prioritized when supported). Recommended obfuscation parameters are randomly
+selected per connection, but of course you can customize them. Note that jumper
+doesn't negotiate non-default parameters.
+
+```toml
+[wireguard_device_params.amneziawg]
+i1 = "<b 0x1234>"
+...
+```
 
 ## Yggdrasil DPI
 

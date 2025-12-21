@@ -40,6 +40,9 @@ pub struct Header {
 #[derive(Serialize, Deserialize)]
 pub struct WgHeader {
     pub pub_key: String,
+
+    /// Type "wireguard" is assumed if not specified.
+    pub wireguard_types: Option<Vec<String>>,
 }
 
 /// Try to negotiate a traversal session. Socket must already be connected.
@@ -102,7 +105,7 @@ pub async fn try_session(
     let shared_secret = {
         let mut arr = [self_header.secret_rand, remote_header.secret_rand];
         arr.sort();
-        format!("{:08x}{:08x}", arr[0], arr[1])
+        ((arr[0] as u64) << 32) | (arr[1] as u64)
     };
 
     let filter_cand = |h: &Header, is_ipv4| {
@@ -134,7 +137,7 @@ pub async fn try_session(
     };
     let inet = InetTraversal {
         session_id,
-        shared_secret,
+        shared_secret: format!("{shared_secret:016x}"),
     };
     let inet_sock = network::traverse_udp(&state, &params, &local, &remote_cand, Some(&inet))
         .await
@@ -145,8 +148,11 @@ pub async fn try_session(
     if self_header.wireguard && remote_header.wireguard {
         use crate::bridge_wireguard;
 
-        let (pub_key, priv_key) = bridge_wireguard::wg_genkeys().await?;
-        let self_wg = WgHeader { pub_key };
+        let (pub_key, priv_key) = bridge_wireguard::wg_genkeys(&config).await?;
+        let self_wg = WgHeader {
+            pub_key,
+            wireguard_types: Some(config.wireguard_types.clone()),
+        };
 
         let remote_wg = utils::timeout(
             Duration::from_secs(10),
@@ -154,6 +160,22 @@ pub async fn try_session(
         )
         .await
         .map_err(map_info!("Failed to exchange wireguard headers"))?;
+
+        let remote_wg_types = remote_wg
+            .wireguard_types
+            .unwrap_or_else(|| vec!["wireguard".to_string()]);
+
+        let wg_type = 'wg_type: loop {
+            for wg_type in ["amneziawg", "wireguard"] {
+                let cond = |s: &Vec<_>| s.iter().any(|t| t == wg_type);
+                if cond(&config.wireguard_types) && cond(&remote_wg_types) {
+                    break 'wg_type wg_type.to_string();
+                }
+            }
+
+            debug!("No common wireguard type with remote");
+            return Err(());
+        };
 
         if !bridge_wireguard::verify_pub_key(remote_wg.pub_key.as_bytes()) {
             info!("Remote pub key is malformed: {:?}", remote_wg.pub_key);
@@ -169,6 +191,8 @@ pub async fn try_session(
             local_ygg_addr: state.router.read().await.address,
             yggdrasil_socket: socket,
             inet_socket: inet_sock,
+            shared_secret,
+            wg_type,
         };
 
         return bridge_wireguard::start_bridge(config, state, params).await;
