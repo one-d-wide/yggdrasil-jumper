@@ -39,7 +39,7 @@ pub async fn verify(config: &ConfigInner) -> SilentResult<()> {
         ("ip link", "iproute2"),
         ("iptables --help", "iptables"),
         ("ip6tables --help", "iptables"),
-        ("conntrack help", "conntrack-tools"),
+        ("conntrack --help", "conntrack-tools"),
     ];
 
     for wg_type in Iterator::chain(
